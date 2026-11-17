@@ -1,0 +1,48 @@
+# Segredos e configuração local
+token.txt
+config.json
+.env
+.env.*
+*.pem
+*.key
+secrets*
+
+# Banco, backups e dados do servidor
+memi.db
+memi.db-*
+*.db
+*.db-*
+*.db.gz
+*.sqlite
+*.sqlite-*
+backups/
+exports/
+*.csv
+mudae_amostras*.json
+
+# Logs
+*.log
+*.log.*
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+build/
+dist/
+*.egg-info/
+.venv/
+venv/
+env/
+
+# Editores e sistema
+.vscode/
+.idea/
+*.swp
+Thumbs.db
+Desktop.ini
+.DS_Store

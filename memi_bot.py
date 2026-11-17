@@ -1,0 +1,3221 @@
+"""MeMi BOT: rankings de música, atividade, perfis, níveis e conquistas para um servidor Discord.
+Leia LEIA-ME.md para instalação, migração, catálogo e testes ao vivo.
+O banco original é estendido, com backup antes da primeira migração.
+"""
+
+import asyncio
+import heapq
+import json
+import logging
+import os
+import shutil
+import socket
+import subprocess
+import sys
+import threading
+import typing
+import unicodedata
+from logging.handlers import RotatingFileHandler
+import csv
+import io
+import re
+import sqlite3
+import time
+from time import monotonic
+from collections import Counter
+from contextlib import closing
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from urllib.parse import parse_qs, urlparse
+
+import aiohttp
+import changelog as versoes_bot
+import discord
+import emojis
+import extras
+import imagens
+import mudae as mudae_tracker
+import progressao
+import tags
+from discord.ext import commands
+from banco import (
+    BACKUPS_EXTRAS,
+    Banco,
+    BancoLegado,
+    CATALOGO,
+    COMANDOS_MUDAE,
+    FUSO,
+    LIMITE_XP_POR_MINUTO,
+    NOMES_BOTS_MUSICA,
+    PREFIXO_MUDAE,
+    RE_BY,
+    RE_ID,
+    RE_JOCKIE,
+    RE_LINK,
+    RE_PEDIDO,
+    RE_TRACO,
+    SPOTIFY_OEMBED,
+    TIPOS_SPOTIFY,
+    VERSAO_BANCO,
+    YOUTUBE_OEMBED,
+    analisar_link,
+    backup_antes_migracao,
+    backup_sqlite,
+    chave_deezer,
+    chave_musica,
+    consulta_do_pedido,
+    consulta_musical,
+    copiar_backup_extra,
+    dividir,
+    eh_mudae,
+    eh_pedido,
+    extrair_musica,
+    limites_periodo,
+    limpar,
+    normalizar,
+    normalizar_artista,
+    sem_acento,
+)
+from estilo import (
+    BOT_NAME,
+    COR_PADRAO,
+    EMOJI,
+    LIMITE_CAMPO,
+    MEDALHAS,
+    LIMITE_DESCRICAO,
+    MESES_EXTENSO,
+    campo,
+    cortar,
+    embed_ajuda,
+    embed_changelog,
+    embed_nivel,
+    embed_ranking,
+    embed_resumo,
+    emoji_simples,
+    linha_faixa,
+    milhar,
+    plural,
+    responder,
+    rotulo_periodo,
+    texto_progresso,
+)
+from estilo import rodape as rodape_do_bot
+
+# --- CONFIGURAÇÃO ---------------------------------------------------------
+# O token fica no arquivo "token.txt" na mesma pasta do bot (só o token, nada mais).
+_ARQ_TOKEN = Path(__file__).with_name("token.txt")
+TOKEN = _ARQ_TOKEN.read_text(encoding="utf-8").strip() if _ARQ_TOKEN.exists() else ""
+
+PREFIX = "mm!"
+
+# O bot acompanha todos os chats acessíveis; o config.json só guarda os IDs do dono,
+# do canal de avisos e do servidor.
+_ARQ_CONFIG = Path(__file__).with_name("config.json")
+CONFIG = json.loads(_ARQ_CONFIG.read_text(encoding="utf-8")) if _ARQ_CONFIG.exists() else {}
+if not isinstance(CONFIG, dict):
+    raise ValueError("config.json precisa conter um objeto JSON.")
+
+
+def _id_config(chave: str, variavel: str) -> int:
+    return int(os.getenv(variavel, str(CONFIG.get(chave, 0))))
+
+
+# Trechos do nome dos bots de música (minúsculo). () aceita qualquer bot.
+# Pancake -> embed "Now Playing" (formato "Título - Artista")
+# Jockie  -> embed "Started playing" (formato "Título by Artista")
+
+# Mensagem de PESSOA que conta como pedido de música.
+# Pega: m!play, m!p, p!play, p!p (maiúsculas não importam). NÃO pega m!pause, m!playlist...
+
+# Nomes que ativam cada ranking: mm!musicas <nome>
+NOMES_RANKING_ARTISTA = ("artista", "artistas")
+NOMES_RANKING_USUARIO = ("ios", "usuario", "usuarios", "usuário", "usuários", "pedidos", "users")
+NOMES_RANKING_MUSICA = ("", "musica", "musicas", "música", "músicas", "geral")
+
+# Fuso usado no Wrapped e nas planilhas (Brasília). O ID do Discord guarda o horário em UTC.
+MESES = ("jan", "fev", "mar", "abr", "mai", "jun", "jul", "ago", "set", "out", "nov", "dez")
+DIAS_SEMANA = ("segunda", "terça", "quarta", "quinta", "sexta", "sábado", "domingo")
+
+# mm!aleatoria mostra este comando (num embed) pra pessoa copiar e colar no chat
+COMANDO_PLAY = "m!play"
+DEEZER_API = "https://api.deezer.com"  # API pública, não precisa de chave
+DEEZER_ESPERA = 8  # segundos máx. esperando o Deezer por comando
+DEEZER_REPETIR_APOS = 7 * 24 * 3600  # quando não achou capa/gênero, tenta de novo depois de 7 dias
+LINK_ESPERA = 6  # segundos máx. esperando o título de um link
+LINK_REPETIR_APOS = 24 * 3600  # link cujo título não veio: tenta de novo depois de 1 dia
+WRAPPED_TOP_GENERO = 10  # quantos pedidos mais feitos entram na conta do gênero favorito
+LIMITE_BUSCA_NOMES = 150  # máx. de pessoas buscadas na API ao exportar (o resto sai só com o ID)
+
+POR_PAGINA = 10  # itens por página do ranking
+HALL_POR_PAGINA = 6  # períodos por página do mm!hall
+HALL_NOME_MAXIMO = 32  # nomes maiores são cortados com … no mm!hall
+ARQUIVO_BANCO = Path(__file__).with_name("memi.db")  # fica na mesma pasta do bot
+MANUTENCAO_INTERVALO = 15  # segundos entre passadas da manutenção (avisos, fechamento, backup)
+IMAGEM_TIMEOUT = 15  # segundos para gerar uma imagem (em thread) antes de desistir
+SYNC_PERIODICO = 900  # segundos entre leituras de segurança (eventos perdidos sem reconexão)
+SYNC_REPETIR_APOS_ERRO = 900  # segundos de espera antes de repetir uma leitura que falhou
+SYNC_PROGRESS_INTERVAL = 30  # evita limitar a API ao editar a mensagem de progresso
+PORTA_UNICA = 47653  # impede abrir o bot duas vezes (senão ele responderia em dobro)
+SYNC_REPETIR_APOS_FALHA = 120  # segundos até repetir depois de uma leitura interrompida
+FALHAS_PARA_ALERTAR = 3  # leituras seguidas com erro antes de avisar o dono por DM
+ALERTA_INTERVALO = 6 * 3600  # no máximo uma DM de alerta nesse intervalo
+ERROS_REDE = (
+    discord.HTTPException,
+    aiohttp.ClientError,
+    aiohttp.http_exceptions.HttpProcessingError,
+    asyncio.TimeoutError,
+    OSError,
+)
+# --------------------------------------------------------------------------
+
+
+def celula(valor):
+    """Evita 'injeção de fórmula' no Excel: texto que começa com = + - @ vira texto puro."""
+    if isinstance(valor, str) and valor[:1] in ("=", "+", "-", "@", "\t", "\r"):
+        return "'" + valor
+    return valor
+
+
+def gerar_csv(cabecalho, linhas) -> io.BytesIO:
+    """CSV com ';' e UTF-8 com BOM: o Excel em português abre direto, com acentos e colunas certas."""
+    buf = io.StringIO()
+    escritor = csv.writer(buf, delimiter=";")
+    escritor.writerow(cabecalho)
+    for linha in linhas:
+        escritor.writerow([celula(c) for c in linha])
+    return io.BytesIO(buf.getvalue().encode("utf-8-sig"))
+
+
+def configurar_log(caminho=None, nivel=logging.INFO):
+    """Log rotativo (3 arquivos de até 2 MB) na raiz. Devolve o handler para quem quiser fechá-lo."""
+    caminho = Path(caminho) if caminho else Path(__file__).with_name("memi_bot.log")
+    handler = RotatingFileHandler(caminho, maxBytes=2_000_000, backupCount=3, encoding="utf-8")
+    handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
+    raiz = logging.getLogger()
+    raiz.addHandler(handler)
+    raiz.setLevel(nivel)
+    return handler
+
+
+class FluxoLog:
+    """Substitui stdout/stderr quando não há console (pythonw): cada linha vira um registro de log."""
+
+    encoding = "utf-8"
+
+    def __init__(self, nome="memi.stdout", nivel=logging.ERROR):
+        self.logger, self.nivel, self._pendente = logging.getLogger(nome), nivel, ""
+
+    def write(self, texto):
+        self._pendente += texto
+        *linhas, self._pendente = self._pendente.split("\n")
+        for linha in linhas:
+            if linha.strip():
+                self.logger.log(self.nivel, linha.rstrip())
+        return len(texto)
+
+    def flush(self):
+        pass
+
+    def isatty(self):
+        return False
+
+
+def travar_instancia(porta=PORTA_UNICA, espera=0.0):
+    """Socket que marca esta cópia como a única em execução, ou None se já existe outra.
+    Mantenha a referência viva enquanto o bot rodar. `espera`: segundos tentando de novo
+    (no reinício, a cópia nova espera a antiga terminar de fechar)."""
+    limite = monotonic() + espera
+    while True:
+        trava = socket.socket()
+        try:
+            trava.bind(("127.0.0.1", porta))
+            return trava
+        except OSError:
+            trava.close()
+        if monotonic() >= limite:
+            return None
+        time.sleep(0.5)
+
+
+# --- Reinício -----------------------------------------------------------------
+# Três jeitos de reiniciar, todos fechando o bot com calma antes: `mm!reiniciar` (só o dono),
+# "Reiniciar" no ícone da bandeja e o arquivo reiniciar.bat. Quem pede marca o reinício e
+# fecha o bot; quando ele termina, o programa abre uma cópia nova (com ARG_REINICIO, que
+# espera a trava ser liberada) e sai. O reiniciar.bat avisa a cópia que está rodando pela
+# porta da trava; se não houver nenhuma, ele só abre o bot.
+ARG_REINICIO = "--reiniciando"
+ARG_PEDIR_REINICIO = "--reiniciar"
+ESPERA_REINICIO = 30.0
+REINICIO = {"pedido": False, "loop": None}
+
+
+def espera_trava():
+    """Quanto tempo esperar pela trava: só no reinício (a cópia antiga ainda está saindo)."""
+    return ESPERA_REINICIO if ARG_REINICIO in sys.argv else 0.0
+
+
+def pedir_reinicio():
+    """Marca o reinício e fecha o bot (pode ser chamado de outra thread)."""
+    REINICIO["pedido"] = True
+    loop = REINICIO["loop"]
+    if loop is not None and loop.is_running():
+        asyncio.run_coroutine_threadsafe(bot.close(), loop)
+
+
+def ouvir_pedidos(trava):
+    """Atende o reiniciar.bat: ele conecta na porta da trava e manda "reiniciar"."""
+    trava.listen(1)
+
+    def atender():
+        while True:
+            try:
+                conexao, _ = trava.accept()
+            except OSError:
+                return  # trava fechada: o bot está saindo
+            with conexao:
+                conexao.settimeout(3)
+                try:
+                    pedido = conexao.recv(32).strip()
+                except OSError:
+                    continue
+            if pedido == b"reiniciar":
+                logging.info("Reinício pedido pelo reiniciar.bat.")
+                pedir_reinicio()
+
+    threading.Thread(target=atender, daemon=True, name="pedidos-de-reinicio").start()
+
+
+def mandar_reinicio(porta=PORTA_UNICA):
+    """Pede para a cópia que está rodando reiniciar. False se não há nenhuma rodando."""
+    try:
+        with socket.create_connection(("127.0.0.1", porta), timeout=3) as conexao:
+            conexao.sendall(b"reiniciar")
+        return True
+    except OSError:
+        return False
+
+
+def abrir_nova_copia():
+    """Abre de novo o mesmo programa (memi_bot.py ou memi_tray.py), sem janela."""
+    script = Path(sys.argv[0]).resolve()
+    argumentos = [a for a in sys.argv[1:] if a not in (ARG_REINICIO, ARG_PEDIR_REINICIO)]
+    comando = [sys.executable, str(script), *argumentos, ARG_REINICIO]
+    opcoes = {}
+    if os.name == "nt":
+        opcoes["creationflags"] = subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
+    else:
+        opcoes["start_new_session"] = True
+    subprocess.Popen(comando, cwd=str(script.parent), close_fds=True, **opcoes)
+    logging.info("Abrindo o bot de novo.")
+
+
+def reabrir_se_pedido(trava):
+    """No fim do programa: se pediram reinício, solta a trava e abre a cópia nova."""
+    if not REINICIO["pedido"]:
+        return False
+    trava.close()
+    abrir_nova_copia()
+    return True
+
+
+def intent_membros(valor):
+    """Server Members Intent vem ligada; só a variável MEMI_MEMBERS_INTENT=0 a desliga."""
+    return valor != "0"
+
+
+MSG_INTENT_MEMBROS = (
+    "O Discord recusou uma intent privilegiada; o bot tentou seguir sem a Server Members Intent "
+    "(provavelmente desativada no Developer Portal), e quem saiu do servidor continua aparecendo "
+    "nos rankings. Para esconder essas pessoas, ative-a em Developer Portal > Bot > Privileged "
+    "Gateway Intents e reinicie o bot."
+)
+MSG_INTENT_MENSAGENS = (
+    "O Discord recusou a Message Content Intent. Ative-a em Developer Portal > Bot > Privileged "
+    "Gateway Intents e reinicie o bot."
+)
+
+
+CORES = {
+    "vermelho": 0xED4245,
+    "laranja": 0xE67E22,
+    "amarelo": 0xF1C40F,
+    "dourado": 0xFFD700,
+    "verde": 0x57F287,
+    "ciano": 0x1ABC9C,
+    "azul": 0x3498DB,
+    "roxo": 0x9B59B6,
+    "rosa": 0xEB459E,
+    "marrom": 0x8B5A2B,
+    "cinza": 0x95A5A6,
+    "branco": 0xFFFFFF,
+    "preto": 0x000001,  # 0 o Discord trata como "sem cor"
+}
+NOMES_COR_PADRAO = ("padrao", "resetar", "reset", "remover")
+
+
+def interpretar_cor(texto):
+    """Cor de embed a partir de #RRGGBB / RRGGBB / 0xRRGGBB / #RGB ou de um nome de CORES.
+    Devolve None para voltar à cor padrão; ValueError se não entender."""
+    t = sem_acento(texto or "").strip()
+    if t in NOMES_COR_PADRAO:
+        return None
+    if t in CORES:
+        return CORES[t]
+    t = t[1:] if t.startswith("#") else t[2:] if t.startswith("0x") else t
+    if len(t) == 3:
+        t = "".join(c * 2 for c in t)
+    if len(t) != 6 or any(c not in "0123456789abcdef" for c in t):
+        raise ValueError(f"cor inválida: {texto!r}")
+    return int(t, 16) or CORES["preto"]
+
+
+def data_local(message_id: int) -> datetime:
+    """Horário (fuso de Brasília) em que a mensagem foi enviada, tirado do próprio ID."""
+    return discord.utils.snowflake_time(message_id).astimezone(FUSO)
+
+
+# ===== Configuração da versão 2 =============================================
+MEMI_ID = _id_config("owner_id", "MEMI_OWNER_ID")
+CANAL_AVISOS = _id_config("notice_channel_id", "MEMI_NOTICE_CHANNEL_ID")
+# Precisa estar ativa no Developer Portal (Server Members Intent); é ela que permite tirar
+# dos rankings quem saiu do servidor. MEMI_MEMBERS_INTENT=0 desliga (e quem saiu volta a aparecer).
+MEMBERS_INTENT = intent_membros(os.getenv("MEMI_MEMBERS_INTENT"))
+# Opcional se o bot só está em um servidor ou enxerga CANAL_AVISOS.
+SERVIDOR_ID = _id_config("guild_id", "MEMI_GUILD_ID")
+# Acrescente waifu/husbando/marry somente depois de confirmar no servidor.
+# Tags (títulos + insígnias) ficam em tags.py; XP, níveis e patentes em progressao.py.
+
+
+def xp_de(totais):
+    """XP a partir de um dicionário com os totais de mensagens, pedidos e mudae (roletadas)."""
+    return progressao.xp(totais["mensagens"], totais["pedidos"], totais["mudae"])
+
+
+def intervalo(periodo="", agora=None):
+    agora = (agora or datetime.now(FUSO)).astimezone(FUSO)
+    periodo = sem_acento(periodo)
+    if periodo == "mes":
+        inicio, rotulo = (
+            agora.replace(day=1, hour=0, minute=0, second=0, microsecond=0),
+            "mês atual",
+        )
+    elif periodo == "ano":
+        inicio, rotulo = (
+            agora.replace(month=1, day=1, hour=0, minute=0, second=0, microsecond=0),
+            "ano atual",
+        )
+    else:
+        return 0, ""
+    return discord.utils.time_snowflake(inicio), rotulo
+
+
+ADMINS = {int(x) for x in (MEMI_ID, *CONFIG.get("admin_ids", ())) if int(x)}
+
+
+def eh_admin(usuario_id):
+    """O dono e quem estiver em `admin_ids` no config.json podem usar os comandos de admin."""
+    return usuario_id in ADMINS
+
+
+def problemas_config():
+    """O que falta no config.json para o bot funcionar por inteiro (vazio se está tudo certo)."""
+    return [
+        descricao
+        for valor, descricao in (
+            (MEMI_ID, "owner_id (sem ele, ninguém usa os comandos de dono)"),
+            (CANAL_AVISOS, "notice_channel_id (sem ele, nenhum aviso é postado)"),
+        )
+        if not valor
+    ]
+
+
+def so_memi():
+    async def permitido(ctx):
+        if not eh_admin(ctx.author.id):
+            raise commands.CheckFailure("Só os admins do bot podem usar esse comando.")
+        return True
+
+    return commands.check(permitido)
+
+
+Banco.pasta_backup_extra = CONFIG.get("backup_extra_dir", "")
+
+
+# ===== Capas e gêneros (Deezer) ============================================
+class Deezer:
+    """Busca capa do álbum e gênero na API pública do Deezer e guarda no banco (cache)."""
+
+    def __init__(self, banco):
+        self.banco = banco
+        self.session = None
+        self.sem = asyncio.Semaphore(3)  # no máx. 3 pedidos ao mesmo tempo (o Deezer tem limite)
+
+    async def fechar(self):
+        if self.session and not self.session.closed:
+            await self.session.close()
+
+    def _sessao(self):
+        if self.session is None or self.session.closed:
+            self.session = aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(total=6),
+                headers={"User-Agent": f"{BOT_NAME}/1.0"},
+            )
+        return self.session
+
+    async def baixar_bytes(self, url, limite=2_000_000):
+        """Bytes de uma imagem (capa de álbum), ou None se falhar ou passar de `limite` bytes."""
+        if not url:
+            return None
+        async with self.sem:
+            try:
+                async with self._sessao().get(url) as resp:
+                    if resp.status != 200:
+                        return None
+                    dados = await resp.content.read(limite + 1)
+            except (aiohttp.ClientError, asyncio.TimeoutError):
+                return None
+        return dados if len(dados) <= limite else None
+
+    async def _get(self, caminho, params=None):
+        """JSON da resposta, ou None se deu erro (rede, limite, id inexistente...)."""
+        self._sessao()
+        async with self.sem:
+            try:
+                async with self.session.get(f"{DEEZER_API}{caminho}", params=params) as resp:
+                    if resp.status != 200:
+                        return None
+                    dados = await resp.json(content_type=None)
+            except (aiohttp.ClientError, asyncio.TimeoutError, ValueError):
+                return None
+        # o Deezer devolve erros (ex.: limite de pedidos) como {"error": {...}} com status 200
+        if not isinstance(dados, dict) or "error" in dados:
+            return None
+        return dados
+
+    async def _buscar(self, q: str):
+        """(capa, genero); ('', '') se não achou; None se deu erro (não vale guardar)."""
+        dados = await self._get("/search", {"q": q, "limit": 1})
+        if dados is None:
+            return None
+        itens = dados.get("data") or []
+        if not itens:
+            return "", ""
+        album = itens[0].get("album") or {}
+        capa = album.get("cover_medium") or album.get("cover") or ""
+        genero = ""
+        if album.get("id"):
+            # o gênero não vem na busca: fica no álbum
+            det = await self._get(f"/album/{album['id']}")
+            generos = ((det or {}).get("genres") or {}).get("data") or []
+            if generos:
+                genero = generos[0].get("name") or ""
+        return capa, genero
+
+    async def info(self, texto: str, titulo: str = "", artista: str = ""):
+        """(capa, genero) do que foi pedido/tocado. Com título+artista a busca é mais precisa."""
+        texto = (texto or "").strip()[:100]
+        chave = normalizar(texto)
+        if not chave or texto.lower().startswith(("http://", "https://")):
+            return "", ""
+
+        guardado = self.banco.cache_deezer(chave)
+        agora = int(time.time())
+        if guardado and (
+            (guardado[0] and guardado[1]) or agora - guardado[2] < DEEZER_REPETIR_APOS
+        ):
+            return guardado[0], guardado[1]
+
+        achado = None
+        if titulo and artista:
+            t, a = titulo.replace('"', " "), artista.replace('"', " ")
+            achado = await self._buscar(f'artist:"{a}" track:"{t}"')
+            if achado == ("", ""):
+                achado = await self._buscar(f"{t} {a}")
+        else:
+            achado = await self._buscar(texto)
+
+        if achado is None:  # erro de rede: não guarda, usa o que já tinha
+            return (guardado[0], guardado[1]) if guardado else ("", "")
+        self.banco.salvar_cache_deezer(chave, achado[0], achado[1], agora)
+        return achado
+
+    async def info_seguro(self, texto: str, titulo: str = "", artista: str = ""):
+        """Igual ao info, mas nunca trava nem dá erro: no pior caso volta ('', '') e o embed sai sem capa."""
+        try:
+            return await asyncio.wait_for(self.info(texto, titulo, artista), DEEZER_ESPERA)
+        except asyncio.TimeoutError:
+            return "", ""
+        except Exception:  # noqa: BLE001 - capa é enfeite, não pode derrubar o comando
+            logging.warning("Falha ao buscar a capa de %r.", texto, exc_info=True)
+            return "", ""
+
+
+# ===== Títulos de links (YouTube / Spotify) ================================
+
+
+def posicao_texto(posicao: int, total: int) -> str:
+    """'🥇 #1 de 25' (medalha só pro top 3)."""
+    medalha = {1: "🥇 ", 2: "🥈 ", 3: "🥉 "}.get(posicao, "🏅 ")
+    return f"{medalha}**#{posicao}** de {total}"
+
+
+def formatar_consulta(texto: str, achado=None, limite: int = 60) -> str:
+    """Como mostrar um pedido: se for link com título conhecido, vira [Título](link); senão o texto em código."""
+    if achado:
+        nome, url = achado
+        nome = nome.replace("[", "(").replace("]", ")")
+        if len(nome) > limite:
+            nome = nome[: limite - 1] + "…"
+        return f"[{nome}]({url})"
+    return "`" + " ".join(texto.split()).replace("`", "'")[:limite] + "`"
+
+
+class Links:
+    """Descobre o título de links do YouTube (vídeo/playlist) e Spotify (música/álbum/playlist...)
+    pelo oEmbed público e guarda no banco (cache)."""
+
+    def __init__(self, banco):
+        self.banco = banco
+        self.session = None
+        self.sem = asyncio.Semaphore(3)
+
+    async def fechar(self):
+        if self.session and not self.session.closed:
+            await self.session.close()
+
+    async def _oembed(self, endpoint: str, url: str):
+        """dict do oEmbed; {} se o link não existe/é privado; None se foi erro passageiro (não guardar)."""
+        if self.session is None or self.session.closed:
+            self.session = aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(total=5),
+                headers={"User-Agent": f"{BOT_NAME}/1.0"},
+            )
+        params = {"url": url}
+        if endpoint == YOUTUBE_OEMBED:
+            params["format"] = "json"
+        async with self.sem:
+            try:
+                async with self.session.get(endpoint, params=params) as resp:
+                    if resp.status in (400, 401, 403, 404):
+                        return {}
+                    if resp.status != 200:
+                        return None
+                    dados = await resp.json(content_type=None)
+            except (aiohttp.ClientError, asyncio.TimeoutError, ValueError):
+                return None
+        return dados if isinstance(dados, dict) else None
+
+    async def titulo(self, texto: str):
+        """(nome, url_limpa) se o texto tem um link conhecido e deu pra descobrir o título; senão None."""
+        analise = analisar_link(texto)
+        if not analise:
+            return None
+        url, endpoint, tipo = analise
+        agora = int(time.time())
+        guardado = self.banco.cache_link(url)
+        if guardado and (guardado[0] or agora - guardado[1] < LINK_REPETIR_APOS):
+            return (guardado[0], url) if guardado[0] else None
+
+        dados = await self._oembed(endpoint, url)
+        if dados is None:  # erro passageiro: não guarda, tenta de novo na próxima
+            return None
+        nome = " ".join(str(dados.get("title") or "").split())
+        if nome and endpoint == YOUTUBE_OEMBED and dados.get("author_name"):
+            nome += " · " + " ".join(str(dados["author_name"]).split())
+        if nome and tipo:
+            nome += f" ({tipo})"
+        self.banco.salvar_cache_link(url, nome, agora)
+        return (nome, url) if nome else None
+
+    async def titulo_seguro(self, texto: str):
+        """Igual ao titulo, mas nunca trava nem dá erro: no pior caso volta None e o link aparece cru."""
+        try:
+            return await asyncio.wait_for(self.titulo(texto), LINK_ESPERA)
+        except asyncio.TimeoutError:
+            return None
+        except Exception:  # noqa: BLE001 - título é enfeite, não pode derrubar o comando
+            logging.warning("Falha ao buscar o título do link %r.", texto, exc_info=True)
+            return None
+
+
+# ===== Ranking paginado ====================================================
+def pode_anexar(canal):
+    """True se o bot pode enviar arquivos no canal; sem como saber (DM, canal simulado), assume que
+    sim. Sem essa permissão o Discord recusa a mensagem inteira, então o envio cai em texto."""
+    try:
+        return bool(canal.permissions_for(canal.guild.me).attach_files)
+    except AttributeError:
+        return True
+
+
+def periodo_curto(detalhe):
+    """'2026-08' -> 'ago/2026'; '2026' -> '2026'; outro texto -> ''."""
+    if re.fullmatch(r"\d{4}-\d{2}", detalhe or ""):
+        return f"{MESES[int(detalhe[5:7]) - 1]}/{detalhe[:4]}"
+    return detalhe if re.fullmatch(r"\d{4}", detalhe or "") else ""
+
+
+def linha_tag(item, n=1, detalhe=""):
+    """'<emoji> **Nome** — como ganhou · ×N · último: ago/2026'."""
+    info = CATALOGO[item]
+    extras = [info["como"]]
+    if n > 1:
+        extras.append(f"×{n}")
+    if periodo_curto(detalhe):
+        extras.append(f"último: {periodo_curto(detalhe)}")
+    return f"{tags.icone(item)} **{info['nome']}** — " + " · ".join(extras)
+
+
+def juntar_ate(partes, limite, separador="\n", resto="\n+{n} · use mm!tags para ver todas"):
+    """Junta partes inteiras até `limite` caracteres; o que sobrar vira '+N'."""
+    feitas, tamanho = [], 0
+    for i, parte in enumerate(partes):
+        extra = len(parte) + (len(separador) if feitas else 0)
+        if tamanho + extra > limite - 60:
+            return separador.join(feitas) + resto.format(n=len(partes) - i)
+        feitas.append(parte)
+        tamanho += extra
+    return separador.join(feitas)
+
+
+def blocos_por_categoria(posses):
+    """Linhas das tags agrupadas por categoria, com o nome da categoria em negrito."""
+    blocos = []
+    for categoria in tags.CATEGORIAS:
+        linhas = [
+            linha_tag(item, n, detalhe)
+            for item, n, detalhe in posses
+            if CATALOGO[item]["categoria"] == categoria
+        ]
+        if linhas:
+            blocos.append(f"**{categoria}**\n" + "\n".join(linhas))
+    return blocos
+
+
+def imagem_da_tag(ident):
+    """Bytes PNG da insígnia (arquivo da tag ou emblema da patente), ou None."""
+    info = CATALOGO.get(ident or "")
+    if not info:
+        return None
+    if info.get("imagem"):
+        caminho = tags.PASTA_INSIGNIAS / info["imagem"]
+        return caminho.read_bytes() if caminho.exists() else None
+    patente = next((x for x in progressao.PATENTES if tags.id_patente(x) == ident), None)
+    if patente and imagens.disponivel():
+        try:
+            return imagens.gerar_emblema(patente)
+        except Exception:  # noqa: BLE001 - enfeite
+            logging.warning("Falha ao gerar o emblema da patente %s.", ident, exc_info=True)
+            return None
+    return None
+
+
+def indice_do_usuario(linhas, uid):
+    """Posição (0-based) de `uid` numa lista de linhas cujo 1º item é o ID; None se não estiver."""
+    return next((i for i, linha in enumerate(linhas) if linha[0] == uid), None)
+
+
+class RankingView(discord.ui.View):
+    """Ranking paginado com botões ◀ ▶ (qualquer pessoa pode trocar de página).
+    `itens` são textos prontos; a montagem do embed fica em estilo.embed_ranking."""
+
+    def __init__(
+        self,
+        titulo,
+        itens,
+        rodape_partes=(),
+        capa="",
+        *,
+        subtitulo="",
+        meu_indice=None,
+        numerar=True,
+        por_pagina=POR_PAGINA,
+        separador="\n",
+    ):
+        super().__init__(timeout=180)
+        self.titulo = titulo
+        self.itens = itens
+        self.rodape_partes = (
+            (rodape_partes,) if isinstance(rodape_partes, str) else tuple(rodape_partes)
+        )
+        self.capa = capa
+        self.subtitulo = subtitulo
+        self.meu_indice = meu_indice
+        self.numerar = numerar
+        self.por_pagina = por_pagina
+        self.separador = separador
+        self.pagina = 0
+        self.total_paginas = max(1, -(-len(itens) // por_pagina))
+        self.message = None
+        self._atualizar_botoes()
+
+    def montar_embed(self) -> discord.Embed:
+        return embed_ranking(
+            self.titulo,
+            self.itens,
+            pagina=self.pagina,
+            por_pagina=self.por_pagina,
+            subtitulo=self.subtitulo,
+            rodape_partes=self.rodape_partes,
+            capa=self.capa,
+            meu_indice=self.meu_indice,
+            numerar=self.numerar,
+            separador=self.separador,
+        )
+
+    def _atualizar_botoes(self):
+        self.anterior.disabled = self.pagina == 0
+        self.proxima.disabled = self.pagina >= self.total_paginas - 1
+
+    @discord.ui.button(label="◀", style=discord.ButtonStyle.secondary)
+    async def anterior(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.pagina = max(0, self.pagina - 1)
+        self._atualizar_botoes()
+        await interaction.response.edit_message(embed=self.montar_embed(), view=self)
+
+    @discord.ui.button(label="▶", style=discord.ButtonStyle.secondary)
+    async def proxima(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.pagina = min(self.total_paginas - 1, self.pagina + 1)
+        self._atualizar_botoes()
+        await interaction.response.edit_message(embed=self.montar_embed(), view=self)
+
+    async def on_timeout(self):
+        for item in self.children:
+            item.disabled = True
+        if self.message:
+            try:
+                await self.message.edit(view=self)
+            except discord.HTTPException:
+                pass
+
+
+# ===== Funcionalidade 1: músicas ===========================================
+class Musicas(commands.Cog):
+    """Leitura do histórico (só dono) e rankings (todo mundo)."""
+
+    def __init__(self, bot):
+        self.bot = bot
+        self.banco = Banco(ARQUIVO_BANCO)
+        self.deezer, self.links = Deezer(self.banco), Links(self.banco)
+        self.lock, self.avisos_lock = asyncio.Lock(), asyncio.Lock()
+        self.sincronizados = set()
+        self.guild_id = SERVIDOR_ID or int(self.banco.estado("servidor_id", "0"))
+        self.recuperando = True
+        self.tarefas = []
+        self._sync_task = None
+        self._sync_solicitada = False
+        self._sync_completa_pendente = False
+        self._ultimo_sync = 0.0
+        self._ultimo_fechamento = None
+        self._proximo_fechamento = 0.0
+        # Chats que o bot enxerga mas não consegue ler: são pulados, não impedem a importação.
+        self.canais_ignorados = set()
+        self._ignorados_logados = frozenset()
+        self._log_canal_ausente = float("-inf")
+        self._falhas_seguidas = 0
+        self._ultimo_alerta = float("-inf")
+
+    def eh_admin(self, uid):
+        return eh_admin(uid)
+
+    def id_canal_avisos(self):
+        return CANAL_AVISOS
+
+    def falhas_seguidas(self):
+        return self._falhas_seguidas
+
+    def segundos_desde_sync(self):
+        return self._relogio() - self._ultimo_sync if self._ultimo_sync else None
+
+    def canal_avisos(self):
+        """Canal de avisos ou None; o problema vai para o log no máximo uma vez por hora."""
+        canal = self.bot.get_channel(CANAL_AVISOS)
+        if canal is None and self._relogio() - self._log_canal_ausente >= 3600:
+            self._log_canal_ausente = self._relogio()
+            logging.warning("Canal de avisos %s não está acessível.", CANAL_AVISOS)
+        return canal
+
+    async def alertar_dono(self, texto):
+        """DM para o dono, no máximo uma a cada ALERTA_INTERVALO. Nunca gera erro."""
+        if not MEMI_ID or self._relogio() - self._ultimo_alerta < ALERTA_INTERVALO:
+            return
+        try:
+            dono = await self.bot.fetch_user(MEMI_ID)
+            await dono.send(texto)
+            self._ultimo_alerta = self._relogio()
+        except (*ERROS_REDE, AttributeError):
+            logging.warning("Não consegui avisar o dono por DM.", exc_info=True)
+
+    async def _registrar_resultado(self, ok):
+        if ok:
+            if self._falhas_seguidas >= FALHAS_PARA_ALERTAR:
+                await self.alertar_dono(
+                    f"✅ O MeMi Bot voltou a ler o Discord depois de {self._falhas_seguidas} falhas."
+                )
+            self._falhas_seguidas = 0
+            return
+        self._falhas_seguidas += 1
+        if self._falhas_seguidas == FALHAS_PARA_ALERTAR:
+            await self.alertar_dono(
+                f"⚠️ O MeMi Bot falhou {FALHAS_PARA_ALERTAR} leituras seguidas. Veja `mm!status`."
+            )
+
+    def _relogio(self):
+        return time.monotonic()
+
+    async def cog_check(self, ctx):
+        if ctx.guild is None:
+            raise commands.NoPrivateMessage()
+        if not self.guild_id:
+            raise commands.CheckFailure("O bot ainda está identificando o servidor configurado.")
+        if ctx.guild.id != self.guild_id:
+            raise commands.CheckFailure("Este bot está configurado para outro servidor.")
+        return True
+
+    async def cog_unload(self):
+        for tarefa in self.tarefas + ([self._sync_task] if self._sync_task else []):
+            tarefa.cancel()
+        await asyncio.gather(
+            *self.tarefas, *([self._sync_task] if self._sync_task else []), return_exceptions=True
+        )
+        await self.deezer.fechar()
+        await self.links.fechar()
+        self.banco.con.close()
+
+    def guild(self):
+        return self.bot.get_guild(self.guild_id)
+
+    def elegiveis(self):
+        guild = self.guild()
+        if self.bot.intents.members and guild and guild.chunked:
+            return {m.id for m in guild.members}
+        return None
+
+    def nome_pessoa(self, uid):
+        """Nome para textos do Discord (sem menção e com markdown escapado)."""
+        return discord.utils.escape_markdown(self.nome_puro(uid))
+
+    def nome_puro(self, uid):
+        """Apelido atual, ou o último guardado, ou o ID (sem escapes: serve para imagens)."""
+        guild = self.guild()
+        membro = guild.get_member(uid) if guild else None
+        if membro is not None:
+            nome = membro.display_name
+        else:
+            row = self.banco.con.execute(
+                "SELECT nome FROM autores WHERE usuario_id=?", (uid,)
+            ).fetchone()
+            nome = (row[0] if row else "") or str(uid)
+        return nome
+
+    def ranking(self, fonte, desde=0, eh_bot=None):
+        return self.banco.ranking_contagens(fonte, desde, eh_bot=eh_bot, elegiveis=self.elegiveis())
+
+    async def canais_legiveis(self, *, arquivadas=True):
+        """Chats de texto, voz e threads ativas que o bot consegue ler; com `arquivadas`, também
+        as threads arquivadas (fóruns inclusive). Chats visíveis sem permissão de histórico não
+        são erro: ficam em `canais_ignorados` e o motivo vai para o log."""
+        guild = self.guild()
+        canais, erros, ignorados = {}, [], set()
+        if not guild:
+            return [], ["servidor indisponível"]
+
+        def adicionar(canal):
+            if not hasattr(canal, "history"):
+                return
+            perm = canal.permissions_for(guild.me)
+            if not perm.view_channel:
+                return
+            if perm.read_message_history:
+                canais[canal.id] = canal
+            else:
+                ignorados.add(canal.id)
+
+        for canal in guild.channels:
+            adicionar(canal)
+        for thread in guild.threads:
+            adicionar(thread)
+        try:
+            for thread in await guild.active_threads():
+                adicionar(thread)
+        except ERROS_REDE:
+            erros.append("não foi possível listar threads ativas")
+        for pai in guild.channels if arquivadas else ():
+            if not hasattr(pai, "archived_threads"):
+                continue
+            perm = pai.permissions_for(guild.me)
+            if not (perm.view_channel and perm.read_message_history):
+                continue
+            consultas = [{}]
+            if isinstance(pai, discord.TextChannel):
+                consultas.append({"private": True, "joined": not perm.manage_threads})
+            for opcoes in consultas:
+                try:
+                    async for thread in pai.archived_threads(limit=None, **opcoes):
+                        adicionar(thread)
+                except discord.Forbidden:
+                    ignorados.add(pai.id)
+                except ERROS_REDE:
+                    erros.append(f"não foi possível listar threads arquivadas em {pai.id}")
+        self.canais_ignorados = ignorados
+        self._avisar_ignorados()
+        return list(canais.values()), erros
+
+    def _avisar_ignorados(self):
+        """Registra no log, uma vez por mudança, os chats pulados por falta de permissão."""
+        atuais = frozenset(self.canais_ignorados)
+        if atuais and atuais != self._ignorados_logados:
+            logging.warning(
+                "Chats ignorados por falta de permissão de histórico: %s",
+                ", ".join(str(cid) for cid in sorted(atuais)),
+            )
+        self._ignorados_logados = atuais
+
+    def iniciar_sync(self, *, leve=False):
+        """Agenda uma leitura. `leve` pula a listagem de threads arquivadas (cara na API); um
+        pedido completo feito enquanto isso vence e faz a próxima passagem completa."""
+        self._sync_solicitada = True
+        self._sync_completa_pendente = self._sync_completa_pendente or not leve
+        if self._sync_task is None or self._sync_task.done():
+
+            async def recuperar():
+                while self._sync_solicitada:
+                    self._sync_solicitada = False
+                    completa, self._sync_completa_pendente = self._sync_completa_pendente, False
+                    if completa:
+                        await self.sincronizar()
+                    else:
+                        await self.sincronizar(arquivadas=False)
+                await self.enviar_avisos()
+                await self.enviar_resumos()
+                await self.enviar_avisos_nivel()
+
+            self._sync_task = asyncio.create_task(recuperar(), name="memi-sincronizar")
+
+    @commands.Cog.listener()
+    async def on_ready(self):
+        if not self.guild_id:
+            canal = self.bot.get_channel(CANAL_AVISOS)
+            if canal and getattr(canal, "guild", None):
+                self.guild_id = canal.guild.id
+            elif len(self.bot.guilds) == 1:
+                self.guild_id = self.bot.guilds[0].id
+            else:
+                logging.error("Defina MEMI_GUILD_ID: não consegui identificar um único servidor.")
+                return
+            self.banco.definir_estado("servidor_id", self.guild_id)
+        guild = self.guild()
+        if self.bot.intents.members and guild and not guild.chunked:
+            await guild.chunk(cache=True)
+        self.sincronizados.clear()
+        self.iniciar_sync()
+        if not self.tarefas:
+            self.tarefas = [
+                asyncio.create_task(self.manter(), name="memi-manutencao"),
+                asyncio.create_task(self.classificar(), name="memi-generos"),
+                asyncio.create_task(self.preparar_emojis(), name="memi-emojis"),
+                asyncio.create_task(self.historico_mudae(), name="memi-mudae"),
+            ]
+
+    async def historico_mudae(self):
+        """Espera a importação e relê, uma única vez, o histórico dos canais do Mudae (o que foi
+        lido antes desta versão só contava comandos). Falha passageira: tenta de novo depois."""
+        while not self.bot.is_closed():
+            try:
+                await self.bot.wait_until_ready()
+                if self.banco.estado("mudae_historico") == "1":
+                    return
+                if self.banco.estado("importacao_concluida") == "1" and not self.recuperando:
+                    if await self.ler_historico_mudae():
+                        return
+                    await asyncio.sleep(SYNC_REPETIR_APOS_ERRO)
+                    continue
+            except Exception:  # noqa: BLE001 - o tracker nunca derruba o bot
+                logging.exception("Falha ao ler o histórico do Mudae; tentando de novo depois.")
+                await asyncio.sleep(SYNC_REPETIR_APOS_ERRO)
+                continue
+            await asyncio.sleep(MANUTENCAO_INTERVALO)
+
+    async def ler_historico_mudae(self):
+        """Uma passada pelo histórico dos canais onde o Mudae já falou. True se terminou tudo."""
+        guild = self.guild()
+        if guild is None:
+            return False
+        corte = int(self.banco.estado("mudae_corte", "0") or 0)
+        if not corte:
+            corte = discord.utils.time_snowflake(discord.utils.utcnow())
+            self.banco.definir_estado("mudae_corte", corte)
+        con, completo, total = self.banco.con, True, 0
+        for canal_id in self.banco.canais_do_mudae():
+            canal = guild.get_channel_or_thread(canal_id)
+            if canal is None or not hasattr(canal, "history"):
+                continue  # canal apagado: o que já foi contado continua
+            linha = con.execute(
+                "SELECT ultimo_msg_id FROM progresso_mudae WHERE channel_id=?", (canal_id,)
+            ).fetchone()
+            marca = linha[0] if linha else 0
+            if marca >= corte - 1:
+                continue
+            try:
+                async for msg in canal.history(
+                    limit=None,
+                    after=discord.Object(id=marca) if marca else None,
+                    before=discord.Object(id=corte),
+                    oldest_first=True,
+                ):
+                    try:
+                        with con:
+                            if not msg.author.bot:
+                                mudae_tracker.registrar_nomes(con, msg.author)
+                            elif mudae_tracker.eh_do_mudae(msg):
+                                mudae_tracker.registrar(con, msg)
+                    except Exception:  # noqa: BLE001 - uma mensagem estranha não trava o resto
+                        logging.exception("Mensagem %s do Mudae ignorada na releitura.", msg.id)
+                    with con:
+                        total += 1
+                        if total % 200 == 0:
+                            self._marca_mudae(canal_id, msg.id)
+                    if total % 200 == 0:
+                        await asyncio.sleep(0)
+                with con:
+                    self._marca_mudae(canal_id, corte - 1)
+            except discord.Forbidden:
+                continue
+            except (discord.HTTPException, aiohttp.ClientError, asyncio.TimeoutError):
+                logging.warning("Falha ao reler o Mudae no canal %s", canal_id, exc_info=True)
+                completo = False
+        if completo:
+            self.banco.definir_estado("mudae_historico", "1")
+            logging.info("Histórico do Mudae lido: %s mensagens verificadas.", total)
+        return completo
+
+    def _marca_mudae(self, canal_id, msg_id):
+        self.banco.con.execute(
+            "INSERT INTO progresso_mudae VALUES (?,?) ON CONFLICT(channel_id) DO UPDATE "
+            "SET ultimo_msg_id=MAX(ultimo_msg_id, excluded.ultimo_msg_id)",
+            (canal_id, msg_id),
+        )
+
+    @commands.Cog.listener()
+    async def on_message_edit(self, antes, depois):
+        guild = getattr(depois, "guild", None)
+        if guild is None or guild.id != self.guild_id or not mudae_tracker.eh_do_mudae(depois):
+            return
+        self.banco.atualizar_mudae(depois)
+
+    async def preparar_emojis(self):
+        """Envia (uma vez por processo) as insígnias e emblemas como emojis da aplicação e passa a
+        usá-los nas mensagens. Sem sucesso, as mensagens seguem com os emojis padrão."""
+        try:
+            itens = await asyncio.to_thread(emojis.itens_para_enviar)
+            feitos = await emojis.sincronizar(self.bot, self.banco, itens)
+            emojis.aplicar(feitos)
+            logging.info("Emojis personalizados prontos: %s de %s.", len(feitos), len(itens))
+        except Exception:  # noqa: BLE001 - emoji é enfeite; nunca derruba o bot
+            logging.exception("Falha ao preparar os emojis personalizados.")
+
+    @commands.Cog.listener()
+    async def on_resumed(self):
+        self.recuperando = True
+        self.sincronizados.clear()
+        self.iniciar_sync()
+
+    @commands.Cog.listener()
+    async def on_disconnect(self):
+        self.recuperando = True
+        self.sincronizados.clear()
+
+    @commands.Cog.listener()
+    async def on_member_remove(self, member):
+        if member.guild.id == self.guild_id:
+            async with self.lock:
+                if self.banco.estado("importacao_concluida") == "1":
+                    self.banco.reconciliar(avisar=True, elegiveis=self.elegiveis())
+            await self.enviar_avisos()
+
+    @commands.Cog.listener()
+    async def on_member_join(self, member):
+        await self.on_member_remove(member)
+
+    @commands.Cog.listener()
+    async def on_message(self, msg):
+        if msg.guild is None or msg.guild.id != self.guild_id:
+            return
+        if self.recuperando:
+            # Eventos entregues na reconexão esperam o histórico mais antigo.
+            # Não inserir o futuro antes de reconstituir o desempate dos Top 1.
+            if self._sync_task is None or self._sync_task.done():
+                self.iniciar_sync()
+            await asyncio.shield(self._sync_task)
+        async with self.lock:
+            pronto = self.banco.estado("importacao_concluida") == "1" and not self.recuperando
+            # Um canal ainda não lido não pode avançar além do histórico offline.
+            self.banco.receber(
+                msg,
+                avancar=msg.channel.id in self.sincronizados,
+                recompensar=pronto,
+                avisar=pronto,
+                elegiveis=self.elegiveis(),
+                limitar_xp=pronto,
+            )
+        if pronto:
+            await self.enviar_avisos()
+        if msg.channel.id not in self.sincronizados and msg.channel.id not in self.canais_ignorados:
+            self.iniciar_sync()
+
+    async def sincronizar(
+        self, *, completo=False, silencioso=False, status=None, canais=None, arquivadas=True
+    ):
+        async with self.lock:
+            self.recuperando = True
+            inicial = self.banco.estado("importacao_concluida") != "1"
+            silencioso = silencioso or inicial
+            total = 0
+            ultima_edicao = 0.0
+            try:
+                if canais is None:
+                    canais, erros = await self.canais_legiveis(arquivadas=arquivadas)
+                    global_ = True
+                    if not canais:
+                        erros.append("nenhum chat com histórico acessível")
+                else:
+                    erros, global_ = [], False
+                corte = discord.utils.time_snowflake(discord.utils.utcnow())
+                corte_data = discord.utils.snowflake_time(corte).astimezone(FUSO)
+                elegiveis = self.elegiveis()
+                heap = []
+
+                async def proxima(canal, it):
+                    nonlocal total
+                    try:
+                        msg = await anext(it)
+                    except StopAsyncIteration:
+                        # Confirma todo o intervalo somente depois da leitura completa.
+                        self.banco.salvar_marca(canal.id, corte - 1)
+                        self.sincronizados.add(canal.id)
+                    except discord.Forbidden:
+                        if canal.id not in self.canais_ignorados:
+                            logging.warning(
+                                "Sem acesso ao histórico de %s; chat ignorado.", canal.id
+                            )
+                        self.canais_ignorados.add(canal.id)
+                    except ERROS_REDE as exc:
+                        erros.append(f"histórico de {canal.id}: {type(exc).__name__}")
+                        logging.warning("Falha no histórico do canal %s", canal.id, exc_info=True)
+                    else:
+                        heapq.heappush(heap, (msg.id, canal.id, msg, canal, it))
+
+                for canal in canais:
+                    marca = 0 if completo else self.banco.marca(canal.id)
+                    it = canal.history(
+                        limit=None,
+                        after=discord.Object(id=marca) if marca else None,
+                        before=discord.Object(id=corte),
+                        oldest_first=True,
+                    ).__aiter__()
+                    await proxima(canal, it)
+                while heap:
+                    _, _, msg, canal, it = heapq.heappop(heap)
+                    self.banco.receber(
+                        msg,
+                        avancar=True,
+                        recompensar=not silencioso,
+                        avisar=not silencioso,
+                        elegiveis=elegiveis,
+                    )
+                    total += 1
+                    if status and monotonic() - ultima_edicao >= SYNC_PROGRESS_INTERVAL:
+                        try:
+                            await status.edit(
+                                content=f"📖 Lendo {len(canais)} chats e threads • {milhar(total)} mensagens verificadas..."
+                            )
+                        except discord.HTTPException as exc:
+                            logging.warning(
+                                "Não foi possível atualizar o progresso da leitura: %s", exc
+                            )
+                        finally:
+                            # Conta o intervalo depois da resposta do Discord, inclusive após um 429.
+                            ultima_edicao = monotonic()
+                    await proxima(canal, it)
+                    if total % 200 == 0:
+                        await asyncio.sleep(0)
+                # Um resultado parcial não pode fechar períodos nem concluir a importação.
+                if global_ and not erros:
+                    self.banco.reconciliar(avisar=not silencioso, elegiveis=self.elegiveis())
+                    # O fechamento considera o instante até o qual o histórico foi lido. Só roda
+                    # quando o mês virou (ou numa importação/mm!scan, que pode trazer meses
+                    # antigos); a busca dos meses vai para outra thread, longe do loop do bot.
+                    mes_corte = corte_data.strftime("%Y-%m")
+                    if silencioso or self._ultimo_fechamento != mes_corte:
+                        desde_meses = 0 if silencioso else self.banco.inicio_meses_abertos()
+                        datas = await asyncio.to_thread(
+                            self.banco.meses_ativos, desde_meses, isolado=True
+                        )
+                        self.banco.fechar_periodos(
+                            corte_data,
+                            avisar=not silencioso,
+                            elegiveis=self.elegiveis(),
+                            datas=datas,
+                        )
+                    self._ultimo_fechamento = mes_corte
+                    self.banco.definir_estado("importacao_concluida", "1")
+                    self.banco.definir_estado("sincronizacao_completa", "1")
+                    with self.banco.con:
+                        self.banco.con.execute(
+                            "INSERT INTO atividade_scan VALUES (1,?) ON CONFLICT(id) DO UPDATE SET quando=excluded.quando",
+                            (int(time.time()),),
+                        )
+                elif global_:
+                    self.banco.definir_estado("sincronizacao_completa", "0")
+                elif not erros and not inicial:
+                    self.banco.reconciliar(avisar=False, elegiveis=self.elegiveis())
+                self._ultimo_sync = self._relogio()
+                await self._registrar_resultado(not erros)
+                if erros:
+                    logging.warning("Leitura parcial: %s", "; ".join(erros))
+                else:
+                    logging.info(
+                        "Leitura concluída: %s mensagens verificadas em %s chats/threads; silencioso=%s",
+                        total,
+                        len(canais),
+                        silencioso,
+                    )
+                if status:
+                    resumo = f"✅ Leitura concluída: {milhar(total)} mensagens verificadas em {len(canais)} chats/threads. Sem duplicação."
+                    if erros:
+                        resumo = f"⚠️ Leitura parcial: {milhar(total)} mensagens. {len(erros)} falha(s); detalhes no memi_bot.log. Repita mm!scan depois de resolver o problema."
+                    elif silencioso:
+                        resumo += " Histórico e conquistas recalculados sem avisos."
+                    if self.canais_ignorados:
+                        resumo += (
+                            f"\nℹ️ {len(self.canais_ignorados)} chat(s) ignorado(s) por falta de"
+                            " permissão de histórico (lista no memi_bot.log)."
+                        )
+                    await status.edit(content=resumo)
+                return total, erros
+            except Exception:
+                self.banco.definir_estado("sincronizacao_completa", "0")
+                logging.exception("Falha na sincronização; o progresso confirmado foi preservado.")
+                # Sem isso, cada ciclo de manutenção (15 s) repetiria a leitura durante uma queda.
+                self._ultimo_sync = self._relogio() - SYNC_PERIODICO + SYNC_REPETIR_APOS_FALHA
+                await self._registrar_resultado(False)
+                if status:
+                    await status.edit(
+                        content="⚠️ A leitura foi interrompida. Progresso salvo; veja memi_bot.log e tente novamente."
+                    )
+                return total, ["sincronização interrompida"]
+            finally:
+                self.recuperando = False
+        # Avisos são enviados pela manutenção, fora do bloqueio do histórico.
+
+    async def enviar_avisos(self):
+        if self.recuperando or self.banco.estado("importacao_concluida") != "1":
+            return
+        async with self.avisos_lock:
+            canal = self.canal_avisos()
+            if canal is None:
+                return
+            for aid, uid, item, titulo, insignia, detalhe in self.banco.con.execute(
+                "SELECT id,usuario_id,item,titulo,insignia,detalhe FROM avisos WHERE estado='pendente' ORDER BY id LIMIT 20"
+            ).fetchall():
+                info = CATALOGO.get(item)
+                if not info:
+                    continue
+                pessoa = self.guild().get_member(uid) if self.guild() else None
+                row = self.banco.con.execute(
+                    "SELECT nome FROM autores WHERE usuario_id=?", (uid,)
+                ).fetchone()
+                nome = discord.utils.escape_markdown(
+                    pessoa.display_name if pessoa else (row[0] if row else str(uid))
+                )
+                texto = f"🏷️ Parabéns, **{nome}**! Nova tag: {tags.rotulo(item)}"
+                if detalhe and detalhe not in ("geral", "manual"):
+                    tipo_periodo = "ano" if len(detalhe) == 4 else "mes"
+                    texto += f" · {rotulo_periodo(tipo_periodo, detalhe)}"
+                texto += f"\n-# {info['como']}"
+                if not await self._enviar_reservado(
+                    canal,
+                    lambda estado, a=aid: self._marcar_aviso(a, estado),
+                    f"aviso {aid}",
+                    texto,
+                ):
+                    return
+
+    def _marcar_aviso(self, aviso_id, estado):
+        with self.banco.con:
+            self.banco.con.execute("UPDATE avisos SET estado=? WHERE id=?", (estado, aviso_id))
+
+    async def _enviar_reservado(self, canal, marcar, descricao, *texto, **conteudo):
+        """Reserva → envia → confirma. `marcar(estado)` grava o estado no banco.
+        Devolve False quando falta permissão (o chamador deve parar e tentar depois)."""
+        marcar("reservado")
+        try:
+            await canal.send(*texto, allowed_mentions=discord.AllowedMentions.none(), **conteudo)
+        except (discord.Forbidden, discord.NotFound):
+            marcar("pendente")
+            logging.warning("Sem permissão para enviar %s.", descricao)
+            return False
+        except aiohttp.ClientConnectorError:
+            # A requisição nunca saiu da máquina: é certeza de não entrega, então tenta depois.
+            marcar("pendente")
+            logging.warning("Sem conexão para enviar %s; tentando de novo depois.", descricao)
+            return False
+        except (discord.HTTPException, aiohttp.ClientError, asyncio.TimeoutError):
+            logging.exception("Resultado incerto no envio de %s; não será repetido.", descricao)
+            return False  # rede provavelmente instável: só este item fica em risco, não o lote
+        else:
+            marcar("enviado")
+        return True
+
+    async def enviar_resumos(self):
+        """Posta no canal de avisos os resumos de mês/ano pendentes, um embed por resumo."""
+        if self.recuperando or self.banco.estado("importacao_concluida") != "1":
+            return
+        async with self.avisos_lock:
+            canal = self.canal_avisos()
+            if canal is None:
+                return
+            for tipo, periodo, dados in self.banco.resumos_pendentes():
+                capa_url = ""
+                if dados.get("musicas"):
+                    titulo, artista, _ = dados["musicas"][0]
+                    capa_url, _ = await self.deezer.info_seguro(
+                        f"{titulo} {artista}".strip(), titulo, artista
+                    )
+                arquivo = await self._imagem_do_resumo(tipo, periodo, dados, capa_url, canal)
+                embed = embed_resumo(
+                    tipo, periodo, dados, self.nome_pessoa, com_imagem=arquivo is not None
+                )
+                conteudo = {"embed": embed}
+                if arquivo is not None:
+                    embed.set_image(url="attachment://resumo.png")
+                    conteudo["file"] = arquivo
+                elif capa_url:
+                    embed.set_thumbnail(url=capa_url)
+                if self.recuperando:  # uma reconexão pode ter começado durante a busca da capa
+                    return
+                if not await self._enviar_reservado(
+                    canal,
+                    lambda estado, t=tipo, p=periodo: self.banco.marcar_resumo(t, p, estado),
+                    f"resumo {tipo} {periodo}",
+                    **conteudo,
+                ):
+                    return
+
+    async def _imagem_do_resumo(self, tipo, periodo, dados, capa_url, canal):
+        """discord.File com a imagem do resumo, ou None (sem Pillow, sem permissão de anexar ou
+        falha): o embed completo assume."""
+        if not imagens.disponivel() or not pode_anexar(canal):
+            return None
+        guild = self.guild()
+
+        def ganhador(chave, um, varios):
+            lista = dados.get(chave) or []
+            if not lista:
+                return None, None
+            uid, n = lista[0]
+            return uid, (self.nome_puro(uid), plural(n, um, varios))
+
+        uid_dj, dj = ganhador("djs", "pedido", "pedidos")
+        uid_tag, tagarela = ganhador("tagarelas", "mensagem", "mensagens")
+
+        async def avatar_de(uid):
+            membro = guild.get_member(uid) if guild and uid is not None else None
+            return await self.baixar_avatar(membro)
+
+        capa = await self.deezer.baixar_bytes(capa_url)
+        titulo = periodo if tipo == "ano" else MESES_EXTENSO[int(periodo[5:7]) - 1].capitalize()
+        return await self.gerar_imagem(
+            imagens.gerar_resumo,
+            "resumo.png",
+            {
+                "tipo": tipo,
+                "titulo": titulo,
+                "ano": periodo[:4],
+                "dj": dj,
+                "tagarela": tagarela,
+                "musica": tuple(dados["musicas"][0]) if dados.get("musicas") else None,
+                "mensagens": milhar(dados.get("mensagens", 0)),
+                "pedidos": milhar(dados.get("pedidos", 0)),
+                "cor": None,
+            },
+            await avatar_de(uid_dj),
+            await avatar_de(uid_tag),
+            capa,
+            canal=canal,
+        )
+
+    async def enviar_avisos_nivel(self):
+        """Posta no canal de avisos os level ups pendentes: todo nível sai em texto; múltiplos de
+        5 e trocas de patente saem com imagem."""
+        if self.recuperando or self.banco.estado("importacao_concluida") != "1":
+            return
+        async with self.avisos_lock:
+            canal = self.canal_avisos()
+            if canal is None:
+                return
+            guild = self.guild()
+            for aviso_id, uid, nivel_aviso in self.banco.avisos_nivel_pendentes():
+                pessoa = guild.get_member(uid) if guild else None
+                progresso = progressao.progresso(self.banco.xp_usuario(uid))
+                patente = progressao.patente(nivel_aviso)
+                trocou = progressao.trocou_patente(nivel_aviso)
+                arquivo = None
+                if (trocou or nivel_aviso % 5 == 0) and imagens.disponivel() and pode_anexar(canal):
+                    arquivo = await self.gerar_imagem(
+                        imagens.gerar_nivel,
+                        "nivel.png",
+                        {
+                            "nome": self.nome_puro(uid),
+                            "nome_alt": getattr(pessoa, "name", ""),
+                            "nivel": nivel_aviso,
+                            "atual": progresso[0],
+                            "avanco": progresso[1],
+                            "meta": progresso[2],
+                            "patente": patente["nome"],
+                            "cor_patente": patente["cor"],
+                            "patente_minimo": patente["minimo"],
+                            "trocou": trocou,
+                            "cor": self.banco.perfil(uid)["cor"],
+                        },
+                        await self.baixar_avatar(pessoa),
+                        canal=canal,
+                    )
+                avatar_url = pessoa.display_avatar.with_size(128).url if pessoa else ""
+                embed = embed_nivel(
+                    self.nome_pessoa(uid),
+                    nivel_aviso,
+                    progresso,
+                    patente,
+                    trocou=trocou,
+                    icone=tags.icone(tags.id_patente(patente)),
+                    avatar_url=avatar_url,
+                    com_imagem=arquivo is not None,
+                )
+                conteudo = {"embed": embed}
+                if arquivo is not None:
+                    embed.set_image(url="attachment://nivel.png")
+                    conteudo["file"] = arquivo
+                if not await self._enviar_reservado(
+                    canal,
+                    lambda estado, a=aviso_id: self.banco.marcar_aviso_nivel(a, estado),
+                    f"aviso de nível {nivel_aviso}",
+                    **conteudo,
+                ):
+                    return
+
+    async def ciclo_manutencao(self):
+        """Uma passada da manutenção: backup, fechamento de períodos, avisos e leitura de segurança."""
+        if self.recuperando:
+            return
+        # Cópia em outra thread (conexão própria): não trava o bot enquanto comprime o banco.
+        await asyncio.to_thread(self.banco.backup_diario, None, isolado=True)
+        chave = datetime.now(FUSO).strftime("%Y-%m")
+        if (
+            chave != self._ultimo_fechamento
+            and self.banco.estado("importacao_concluida") == "1"
+            and self._relogio() >= self._proximo_fechamento
+        ):
+            # Antes de fechar, recupera os eventos que possam faltar na virada.
+            _, erros = await self.sincronizar()
+            if erros:
+                # Sem isso, uma falha persistente repetiria a leitura completa a cada ciclo.
+                self._proximo_fechamento = self._relogio() + SYNC_REPETIR_APOS_ERRO
+            else:
+                self._ultimo_fechamento = chave
+        await self.enviar_avisos()
+        await self.enviar_resumos()
+        await self.enviar_avisos_nivel()
+        if self._relogio() - self._ultimo_sync > SYNC_PERIODICO:
+            self.iniciar_sync(leve=True)
+
+    async def manter(self):
+        while not self.bot.is_closed():
+            try:
+                await self.bot.wait_until_ready()
+                await self.ciclo_manutencao()
+            except Exception:
+                logging.exception("Falha na manutenção; tentando de novo no próximo ciclo.")
+            await asyncio.sleep(MANUTENCAO_INTERVALO)
+
+    async def classificar(self):
+        while not self.bot.is_closed():
+            try:
+                await self.bot.wait_until_ready()
+                agora = int(time.time())
+                # Consultas de segundo plano rodam em outra thread: com o disco ocupado, não
+                # podem segurar o bot (e o heartbeat do Discord).
+                faixas = await asyncio.to_thread(
+                    self.banco.ler,
+                    "SELECT m.id,m.titulo,m.artista FROM musicas m LEFT JOIN deezer_cache d ON d.chave=chave_deezer(m.titulo||' '||m.artista) LEFT JOIN estado e ON e.chave='genero:'||m.id WHERE (d.chave IS NULL OR (d.genero='' AND d.buscado_em<?)) AND CAST(COALESCE(e.valor,'0') AS INTEGER)<? ORDER BY COALESCE(e.valor,'0'),m.id LIMIT 3",
+                    (agora - DEEZER_REPETIR_APOS, agora - 3600),
+                )
+                for mid, t, a in faixas:
+                    self.banco.definir_estado(f"genero:{mid}", agora)
+                    await self.deezer.info_seguro(f"{t} {a}".strip(), t, a)
+                    await asyncio.sleep(1)
+                consultas = await asyncio.to_thread(
+                    self.banco.ler,
+                    "SELECT chave,texto FROM classificacao_pedidos WHERE genero='' AND consultado_em<? ORDER BY consultado_em,chave LIMIT 3",
+                    (agora - 3600,),
+                )
+                for chave, texto in consultas:
+                    nome = texto
+                    if analisar_link(texto):
+                        achado = await self.links.titulo_seguro(texto)
+                        nome = achado[0] if achado else ""
+                    _, genero = await self.deezer.info_seguro(nome) if nome else ("", "")
+                    with self.banco.con:
+                        self.banco.con.execute(
+                            "UPDATE classificacao_pedidos SET nome=?,genero=?,consultado_em=? WHERE chave=?",
+                            (nome, genero, agora, chave),
+                        )
+                    await asyncio.sleep(1)
+            except Exception:
+                logging.exception("Falha na classificação de gêneros.")
+            await asyncio.sleep(30)
+
+    @commands.command(name="read", hidden=True)
+    @commands.guild_only()
+    @so_memi()
+    async def read(self, ctx, *args):
+        completo = any(sem_acento(x) in ("tudo", "completo", "full") for x in args)
+        canais = []
+        for arg in args:
+            if sem_acento(arg) in ("tudo", "completo", "full"):
+                continue
+            match = re.fullmatch(r"(?:<#)?(\d+)>?", arg)
+            canal = ctx.guild.get_channel_or_thread(int(match[1])) if match else None
+            if not canal or not hasattr(canal, "history"):
+                await responder(
+                    ctx, "aviso", "Canal inválido. Use mm!read, mm!read tudo ou mm!read #canal."
+                )
+                return
+            canais.append(canal)
+        # Sem canais explícitos, verifica todos os chats, inclusive voz e threads.
+        await self.iniciar_leitura(
+            ctx, "📖 Começando a leitura...", completo=completo, canais=canais
+        )
+
+    async def iniciar_leitura(self, ctx, abertura, *, completo=False, canais=None):
+        """Leitura manual do dono (mm!read e mm!scan): silenciosa, uma por vez, com progresso."""
+        if self.lock.locked():
+            await responder(ctx, "aviso", "Já tem uma leitura em andamento. Aguarde terminar.")
+            return
+        status = await ctx.send(abertura)
+        await self.sincronizar(
+            completo=completo, silencioso=True, status=status, canais=canais or None
+        )
+
+    async def enviar_ranking(
+        self,
+        ctx,
+        titulo,
+        itens,
+        *,
+        rodape_partes=(),
+        capa="",
+        subtitulo="",
+        meu_indice=None,
+        numerar=True,
+        por_pagina=POR_PAGINA,
+        separador="\n",
+    ):
+        """Envia um ranking paginado; acrescenta o aviso de importação enquanto ela não terminar."""
+        partes = list(rodape_partes)
+        if self.banco.estado("importacao_concluida") != "1":
+            partes.append(f"{emoji_simples('importando')} importando histórico")
+        view = RankingView(
+            titulo,
+            itens,
+            partes,
+            capa,
+            subtitulo=subtitulo,
+            meu_indice=meu_indice,
+            numerar=numerar,
+            por_pagina=por_pagina,
+            separador=separador,
+        )
+        view.message = await ctx.send(
+            embed=view.montar_embed(), view=view, allowed_mentions=discord.AllowedMentions.none()
+        )
+
+    @commands.command(name="musicas", aliases=["músicas", "ranking", "msc"])
+    @commands.guild_only()
+    async def musicas(self, ctx, *args):
+        palavras = [sem_acento(x) for x in args]
+        if "semana" in palavras:
+            await responder(ctx, "aviso", "Não existe ranking semanal: use mes ou ano.")
+            return
+        periodos = [x for x in palavras if x in ("mes", "ano")]
+        if len(set(periodos)) > 1:
+            await responder(ctx, "aviso", "Use um período por vez: mes ou ano.")
+            return
+        periodo = periodos[0] if periodos else ""
+        palavras = [x for x in palavras if x not in ("mes", "ano")]
+        if "genero" in palavras or "generos" in palavras:
+            if len(palavras) > 1:
+                await responder(ctx, "aviso", "Use mm!musicas genero [mes|ano].")
+                return
+            tipo = "genero"
+        else:
+            tipo = palavras[0] if palavras else ""
+            validos = {
+                sem_acento(x)
+                for x in NOMES_RANKING_MUSICA + NOMES_RANKING_ARTISTA + NOMES_RANKING_USUARIO
+            }
+            if len(palavras) > 1 or tipo not in validos:
+                await responder(ctx, "aviso", "Use mm!musicas [artista|ios|genero] [mes|ano].")
+                return
+        desde, rotulo = intervalo(periodo)
+        capa, meu_indice = "", None
+        if tipo == "genero":
+            linhas = self.banco.ranking_generos(desde)
+            titulo = "🎼 Ranking de gêneros"
+            itens = [f"**{g}** · {q} tocadas · {n} músicas diferentes" for g, q, n in linhas]
+            pendentes = self.banco.generos_pendentes(desde)
+            partes = (
+                f"{pendentes} músicas sem gênero",
+                "classificação automática em segundo plano",
+            )
+        elif tipo in {sem_acento(x) for x in NOMES_RANKING_ARTISTA}:
+            linhas = self.banco.ranking_artistas(desde)
+            titulo = "🎤 Ranking de artistas"
+            itens = [f"**{a[:80]}** · {n} músicas diferentes · {q} tocadas" for a, n, q in linhas]
+            partes = (f"{len(linhas)} artistas",)
+            if linhas:
+                t, a = self.banco.musica_top_do_artista(linhas[0][0], desde)
+                capa, _ = await self.deezer.info_seguro(f"{t} {a}".strip(), t, a)
+        elif tipo in {sem_acento(x) for x in NOMES_RANKING_USUARIO}:
+            linhas = self.ranking("pedidos", desde, False)
+            titulo = "🎧 Quem mais pediu música"
+            itens = [f"**{self.nome_pessoa(uid)}** · {milhar(n)} pedidos" for uid, n in linhas]
+            partes = (f"{len(linhas)} pessoas", f"{milhar(sum(n for _, n in linhas))} pedidos")
+            meu_indice = indice_do_usuario(linhas, ctx.author.id)
+        else:
+            linhas = self.banco.ranking_musicas(desde)
+            titulo = "🏆 Ranking de músicas mais tocadas"
+            itens = [linha_faixa(t, a, q) for t, a, q in linhas]
+            partes = (f"{len(linhas)} músicas", f"{milhar(sum(q for _, _, q in linhas))} tocadas")
+            if linhas:
+                t, a, _ = linhas[0]
+                capa, _ = await self.deezer.info_seguro(f"{t} {a}".strip(), t, a)
+        await self.enviar_ranking(
+            ctx,
+            titulo,
+            itens,
+            rodape_partes=partes,
+            capa=capa,
+            subtitulo=rotulo,
+            meu_indice=meu_indice,
+        )
+
+    async def resumo_musical(self, uid):
+        consultas, exemplos = self.banco.consultas_usuario(uid)
+        mais = ""
+        if consultas:
+            chave, n = consultas.most_common(1)[0]
+            achado = await self.links.titulo_seguro(exemplos[chave])
+            mais = f"{formatar_consulta(exemplos[chave],achado,100)} — {n}x"
+        generos = Counter()
+        pendentes = 0
+        for chave, n in consultas.items():
+            row = self.banco.con.execute(
+                "SELECT genero FROM classificacao_pedidos WHERE chave=?", (chave,)
+            ).fetchone()
+            genero = row[0] if row else ""
+            if not genero and not analisar_link(exemplos[chave]):
+                cache = self.banco.cache_deezer(chave_deezer(exemplos[chave]))
+                genero = cache[1] if cache else ""
+            if genero:
+                generos[genero] += n
+            else:
+                pendentes += 1
+        return mais, (generos.most_common(1)[0][0] if generos else ""), pendentes
+
+    @commands.command(name="perfil", aliases=["p"])
+    @commands.guild_only()
+    async def perfil(self, ctx, pessoa: discord.Member = None):
+        pessoa = pessoa or ctx.author
+        async with ctx.typing():
+            mais, genero, pendentes = await self.resumo_musical(pessoa.id)
+        paginas = self.paginas_perfil(pessoa, mais, genero, pendentes)
+        view = PerfilView(paginas)
+        view.message = await ctx.send(
+            embed=paginas[0], view=view, allowed_mentions=discord.AllowedMentions.none()
+        )
+
+    async def baixar_avatar(self, pessoa):
+        """Bytes PNG do avatar (256 px), ou None se não houver ou falhar (a imagem usa um círculo)."""
+        if pessoa is None:
+            return None
+        try:
+            return await pessoa.display_avatar.replace(size=256, format="png").read()
+        except (discord.HTTPException, aiohttp.ClientError, asyncio.TimeoutError, AttributeError):
+            return None
+
+    async def gerar_imagem(self, funcao, nome_arquivo, *args, canal=None):
+        """discord.File com a imagem gerada em thread, ou None (sem Pillow, sem permissão de anexar
+        no `canal`, erro ou tempo esgotado): nesses casos a mensagem sai só com o texto. Cada
+        chamada cria um arquivo novo."""
+        if not imagens.disponivel() or (canal is not None and not pode_anexar(canal)):
+            return None
+        try:
+            png = await asyncio.wait_for(asyncio.to_thread(funcao, *args), timeout=IMAGEM_TIMEOUT)
+        except Exception:  # noqa: BLE001 - a imagem é enfeite; nunca derruba a mensagem
+            logging.exception("Falha ao gerar a imagem %s", nome_arquivo)
+            return None
+        return discord.File(io.BytesIO(png), filename=nome_arquivo)
+
+    def totais_usuario(self, uid):
+        return {
+            fonte: self.banco.total_usuario(uid, fonte)
+            for fonte in ("mensagens", "pedidos", "mudae")
+        }
+
+    def dados_cartao(self, pessoa):
+        """Dados do cartão de perfil (texto/números simples; a imagem não desenha emojis)."""
+        uid = pessoa.id
+        perfil = self.banco.perfil(uid)
+        totais = self.totais_usuario(uid)
+        xp = self.banco.xp_usuario(uid)
+        nivel_atual, avanco, meta = progressao.progresso(xp)
+        patente = progressao.patente(nivel_atual)
+        titulo = perfil["titulo"] if perfil["titulo"] in CATALOGO else ""
+
+        def posicao(fonte):
+            linhas = self.ranking(fonte, eh_bot=pessoa.bot if fonte == "mensagens" else False)
+            indice = indice_do_usuario(linhas, uid)
+            return f"#{indice + 1} de {len(linhas)}" if indice is not None else ""
+
+        return {
+            "nome": pessoa.display_name,
+            "nome_alt": getattr(pessoa, "name", "") or "",
+            "titulo": CATALOGO[titulo]["nome"] if titulo else "",
+            "insignia": imagem_da_tag(titulo),
+            "nivel": nivel_atual,
+            "avanco": avanco,
+            "meta": meta,
+            "xp": xp,
+            "patente": patente["nome"],
+            "cor_patente": patente["cor"],
+            "mensagens": totais["mensagens"],
+            "pedidos": totais["pedidos"],
+            "roletadas": totais["mudae"],
+            "pos_mensagens": posicao("mensagens"),
+            "pos_pedidos": posicao("pedidos"),
+            "pos_mudae": posicao("mudae"),
+            "cor": perfil["cor"],  # None: as imagens usam o coral padrão
+        }
+
+    def paginas_perfil(self, pessoa, mais="", genero="", pendentes=0):
+        uid = pessoa.id
+        perfil = self.banco.perfil(uid)
+        titulo = perfil["titulo"] if perfil["titulo"] in CATALOGO else ""
+        nome = pessoa.display_name.upper()[:256]
+        mes, _ = intervalo("mes")
+        ano, _ = intervalo("ano")
+        totais = self.totais_usuario(uid)
+        lvl, avanco, meta = progressao.progresso(self.banco.xp_usuario(uid))
+        patente = progressao.patente(lvl)
+        ranks = {}
+        for fonte in totais:
+            linhas = self.ranking(fonte, eh_bot=pessoa.bot if fonte == "mensagens" else False)
+            pos = next((i for i, (u, _) in enumerate(linhas, 1) if u == uid), None)
+            ranks[fonte] = posicao_texto(pos, len(linhas)) if pos else ""
+        posses = self.banco.tags_usuario(uid)
+        insignias = juntar_ate(
+            [tags.icone(k) + (f" ×{n}" if n > 1 else "") for k, n, _ in posses],
+            LIMITE_CAMPO,
+            "  ",
+            "  +{n}",
+        )
+        cor = perfil["cor"] if perfil["cor"] is not None else COR_PADRAO
+        importando = self.banco.estado("importacao_concluida") != "1"
+
+        def pagina(n, *extras):
+            e = discord.Embed(title=nome, color=cor)
+            e.set_thumbnail(url=pessoa.display_avatar.with_size(128).url)
+            aviso = f"{emoji_simples('importando')} importando histórico" if importando else ""
+            e.set_footer(text=rodape_do_bot(f"{n}/3", *extras, aviso))
+            return e
+
+        nivel_nome = f"Nível {lvl} · {patente['nome']}"
+        nivel_valor = texto_progresso(lvl, avanco, meta, progressao.NIVEL_MAXIMO)
+
+        p1 = pagina(1, f"{emoji_simples('genero')} {pendentes} sem gênero" if pendentes else "")
+        cabecalho = []
+        if titulo:
+            cabecalho.append(f"{tags.icone(titulo)} **{CATALOGO[titulo]['nome']}**")
+        if perfil["frase"]:
+            frase = " ".join(perfil["frase"].split())  # itálico não atravessa quebras de linha
+            cabecalho.append(f"*{discord.utils.escape_markdown(frase)}*")
+        if cabecalho:
+            p1.description = "\n".join(cabecalho)
+        campo(p1, f"{EMOJI['musica']} Música", ranks["pedidos"])
+        campo(p1, f"{EMOJI['mensagens']} Mensagens", ranks["mensagens"])
+        campo(p1, f"{EMOJI['mudae']} Mudae", ranks["mudae"])
+        campo(p1, nivel_nome, nivel_valor, False)
+        campo(p1, f"{EMOJI['favorita']} Música favorita", perfil["favorita"], False)
+        campo(p1, f"{EMOJI['mais_pedida']} Música mais colocada", mais, False)
+        campo(p1, f"{EMOJI['genero']} Gênero favorito", genero, False)
+        campo(
+            p1,
+            f"{EMOJI['atividade']} Atividade",
+            f"{EMOJI['mensagens']} **{milhar(totais['mensagens'])}** mensagens · "
+            f"{EMOJI['musica']} **{milhar(totais['pedidos'])}** pedidos · "
+            f"{EMOJI['mudae']} **{milhar(totais['mudae'])}** roletadas",
+            False,
+        )
+        campo(p1, f"{EMOJI['insignias']} Insígnias", insignias, False)
+
+        p2 = pagina(2, "escolha o título com mm!titulo NOME")
+        if posses:
+            p2.description = juntar_ate(
+                blocos_por_categoria(posses), 3800, "\n\n", "\n\n+{n} categorias · use mm!tags"
+            )
+        else:
+            p2.description = "NÃO POSSUI TÍTULOS OU INSÍGNIAS"
+
+        p3 = pagina(3)
+        if perfil["capa"]:
+            p3.set_image(url=perfil["capa"])
+        campo(p3, nivel_nome, nivel_valor, False)
+        campo(p3, f"{EMOJI['mensagens']} Ranking de mensagens", ranks["mensagens"])
+        campo(p3, f"{EMOJI['musica']} Ranking de música", ranks["pedidos"])
+        campo(p3, f"{EMOJI['mudae']} Ranking do Mudae", ranks["mudae"])
+        for fonte, rotulo, emoji in (
+            ("mensagens", "Mensagens", EMOJI["mensagens"]),
+            ("pedidos", "Músicas colocadas", EMOJI["musica"]),
+        ):
+            campo(
+                p3,
+                f"{emoji} {rotulo}",
+                f"Total **{milhar(totais[fonte])}**\n"
+                f"Ano **{milhar(self.banco.total_usuario(uid, fonte, ano))}**\n"
+                f"Mês **{milhar(self.banco.total_usuario(uid, fonte, mes))}**",
+            )
+        campo(p3, f"{EMOJI['mais_pedida']} Música mais colocada", mais, False)
+        # "One Hit Wonders" entra aqui quando o recurso existir (um campo vazio confunde).
+        return [p1, p2, p3]
+
+    # ----- mm!aleatoria ------------------------------------------------------
+    @commands.command(name="aleatoria", aliases=["aleatória", "random"])
+    @commands.guild_only()
+    async def aleatoria(self, ctx: commands.Context):
+        """Sorteia uma música do histórico e mostra o m!play pronto pra copiar."""
+        sorteada = self.banco.musica_aleatoria()
+        if not sorteada:
+            await responder(
+                ctx,
+                "aviso",
+                f"Ainda não tem música guardada (o dono precisa rodar `{PREFIX}read tudo`).",
+            )
+            return
+
+        titulo, artista, vezes = sorteada
+        busca = f"{titulo} {artista}".strip().replace("`", "'")
+        comando = f"{COMANDO_PLAY} {busca}"[:300]
+
+        async with ctx.typing():
+            capa, genero = await self.deezer.info_seguro(
+                f"{titulo} {artista}".strip(), titulo, artista
+            )
+
+        embed = discord.Embed(
+            title="🎲 Música sorteada",
+            description=(
+                f"**{titulo}**"
+                + (f"\n{artista}" if artista else "")
+                + f"\n\nCopie e cole no chat pra tocar:\n```\n{comando}\n```"
+            ),
+            color=0x5865F2,
+        )
+        if capa:
+            embed.set_thumbnail(url=capa)
+        if genero:
+            embed.add_field(name="🎼 Gênero", value=genero, inline=False)
+        embed.set_footer(text=f"{BOT_NAME} • já tocou {vezes}x no chat")
+        await ctx.send(embed=embed)
+
+    # ----- mm!wrapped --------------------------------------------------------
+    @commands.command(name="wrapped", aliases=["w"])
+    @commands.guild_only()
+    @commands.cooldown(1, 10, commands.BucketType.user)
+    async def wrapped(self, ctx: commands.Context):
+        """Seu resumo dos últimos 12 meses de pedidos (mês atual + os 11 anteriores)."""
+        autor = ctx.author
+        agora = datetime.now(FUSO)
+        ano, mes = agora.year, agora.month - 11
+        if mes <= 0:
+            mes += 12
+            ano -= 1
+        inicio = datetime(ano, mes, 1, tzinfo=FUSO)
+        desde = discord.utils.time_snowflake(inicio)
+
+        pedidos = self.banco.pedidos_do_usuario(autor.id, desde)
+        extras_wrapped = self.numeros_wrapped(autor.id, desde)
+        if not pedidos:
+            if not any(extras_wrapped.values()):
+                await responder(
+                    ctx,
+                    "aviso",
+                    f"**{autor.display_name}**, você não tem atividade nos últimos 12 meses.",
+                )
+                return
+            embed = discord.Embed(
+                title=f"🎁 Wrapped de {autor.display_name}"[:256],
+                description=f"De **{MESES[inicio.month - 1]}/{inicio.year}** até hoje.",
+                color=0xEB459E,
+            )
+            self.campos_wrapped(embed, extras_wrapped)
+            embed.set_footer(text=BOT_NAME)
+            await ctx.send(embed=embed)
+            return
+
+        por_mes, por_dia_semana = Counter(), Counter()
+        dias = set()
+        consultas, exemplo = Counter(), {}
+        sem_texto = 0
+        for message_id, conteudo in pedidos:
+            quando = data_local(message_id)
+            por_mes[(quando.year, quando.month)] += 1
+            por_dia_semana[quando.weekday()] += 1
+            dias.add(quando.date())
+            consulta = consulta_do_pedido(conteudo)
+            if consulta is None:
+                sem_texto += 1
+            elif consulta:
+                chave = normalizar(consulta)
+                consultas[chave] += 1
+                exemplo.setdefault(chave, " ".join(consulta.split()))
+
+        # gráfico mês a mês (12 barras)
+        maior = max(por_mes.values())
+        linhas_grafico, contagens = [], []
+        a, m = inicio.year, inicio.month
+        for _ in range(12):
+            n = por_mes[(a, m)]
+            contagens.append(n)
+            barra = "█" * max(1, round(10 * n / maior)) if n else "·"
+            linhas_grafico.append(f"{MESES[m - 1]}/{str(a)[2:]} {barra:<10} {n}")
+            m += 1
+            if m > 12:
+                m, a = 1, a + 1
+
+        (a_top, m_top), n_top = por_mes.most_common(1)[0]
+        dia_top = por_dia_semana.most_common(1)[0][0]
+
+        ranking = self.banco.ranking_usuarios(desde, self.elegiveis())
+        posicao = next((i for i, (uid, _) in enumerate(ranking, start=1) if uid == autor.id), None)
+
+        # capa e gênero favorito: procura no Deezer os pedidos mais feitos
+        top_consultas = consultas.most_common(WRAPPED_TOP_GENERO)
+        capa, generos = "", Counter()
+        top5 = top_consultas[:5]
+        achados = [None] * len(top5)  # títulos dos links (YouTube/Spotify) do top 5
+        if top_consultas:
+            async with ctx.typing():
+                infos, achados = await asyncio.gather(
+                    asyncio.gather(
+                        *(self.deezer.info_seguro(exemplo[ch]) for ch, _ in top_consultas)
+                    ),
+                    asyncio.gather(*(self.links.titulo_seguro(exemplo[ch]) for ch, _ in top5)),
+                )
+            for (_, q), (capa_i, genero_i) in zip(top_consultas, infos):
+                if genero_i:
+                    generos[genero_i] += q
+                if capa_i and not capa:
+                    capa = capa_i  # a do pedido mais feito que tiver capa
+
+        descricao = f"De **{MESES[inicio.month - 1]}/{inicio.year}** até hoje."
+        if sem_texto:
+            descricao += (
+                f"\n⚠️ {sem_texto} pedido(s) sem texto guardado — o dono precisa rodar "
+                f"`{PREFIX}read tudo` pra completar o top de músicas."
+            )
+        embed = discord.Embed(
+            title=f"🎁 Wrapped de {autor.display_name}", description=descricao, color=0xEB459E
+        )
+        embed.set_author(name=autor.display_name, icon_url=autor.display_avatar.with_size(128).url)
+        if capa:
+            embed.set_thumbnail(url=capa)
+        embed.add_field(name="🎧 Pedidos", value=f"**{len(pedidos)}**", inline=True)
+        embed.add_field(name="📅 Dias com pedido", value=f"**{len(dias)}**", inline=True)
+        if posicao:
+            embed.add_field(
+                name="🏆 Posição", value=f"**#{posicao}** de {len(ranking)}", inline=True
+            )
+        embed.add_field(
+            name="🔥 Mês mais ativo", value=f"{MESES[m_top - 1]}/{a_top} ({n_top})", inline=True
+        )
+        embed.add_field(name="🗓️ Dia favorito", value=DIAS_SEMANA[dia_top], inline=True)
+        if generos:
+            mais = generos.most_common(3)
+            valor = f"**{mais[0][0]}** ({mais[0][1]})" + "".join(
+                f"\n{g} ({n})" for g, n in mais[1:]
+            )
+            embed.add_field(name="🎼 Gênero favorito", value=valor, inline=True)
+        if consultas:
+            top = [
+                f"**{i}.** {formatar_consulta(exemplo[ch], achado)} — {q}x"
+                for i, ((ch, q), achado) in enumerate(zip(top5, achados), start=1)
+            ]
+            embed.add_field(name="🎵 Mais pedidos", value="\n".join(top), inline=False)
+        self.campos_wrapped(embed, extras_wrapped)
+        canal_atual = getattr(ctx, "channel", None)
+        arquivo = None
+        if imagens.disponivel() and pode_anexar(canal_atual):
+            arquivo = await self.gerar_imagem(
+                imagens.gerar_wrapped,
+                "wrapped.png",
+                {
+                    "nome": autor.display_name,
+                    "nome_alt": getattr(autor, "name", ""),
+                    "meses": contagens,
+                    "pedidos": len(pedidos),
+                    "dias": len(dias),
+                    "genero": generos.most_common(1)[0][0] if generos else "",
+                    "top": [
+                        (achado[0] if achado else exemplo[ch], q)
+                        for (ch, q), achado in zip(top5, achados)
+                    ][:3],
+                    "cor": self.banco.perfil(autor.id)["cor"],
+                },
+                await self.baixar_avatar(autor),
+                canal=canal_atual,
+            )
+        embed.set_footer(text=BOT_NAME)
+        if arquivo is None:  # sem imagem, o gráfico mês a mês vai em texto
+            embed.add_field(
+                name="📈 Mês a mês",
+                value="```\n" + "\n".join(linhas_grafico) + "\n```",
+                inline=False,
+            )
+            await ctx.send(embed=embed)
+            return
+        embed.set_image(url="attachment://wrapped.png")
+        await ctx.send(embed=embed, file=arquivo)
+
+    def numeros_wrapped(self, uid, desde):
+        """Conversa e Mudae da pessoa no período do Wrapped."""
+        con = self.banco.con
+        um = lambda sql: con.execute(sql, (uid, desde)).fetchone()[0]  # noqa: E731
+        return {
+            "mensagens": um(
+                "SELECT COUNT(*) FROM mensagens g WHERE autor_id=? AND message_id>=? AND NOT EXISTS "
+                "(SELECT 1 FROM mudae m WHERE m.message_id=g.message_id)"
+            ),
+            "rolls": um("SELECT COUNT(*) FROM mudae WHERE usuario_id=? AND message_id>=?"),
+            "casamentos": um(
+                "SELECT COUNT(*) FROM mudae_casamentos WHERE usuario_id=? AND message_id>=?"
+            ),
+        }
+
+    def campos_wrapped(self, embed, numeros):
+        campo(embed, "💬 Mensagens", milhar(numeros["mensagens"]) if numeros["mensagens"] else "")
+        campo(embed, "🎎 Rolls", milhar(numeros["rolls"]) if numeros["rolls"] else "")
+        campo(embed, "💍 Casamentos", milhar(numeros["casamentos"]) if numeros["casamentos"] else "")
+
+    # ----- mm!exportar -------------------------------------------------------
+    async def resolver_nomes(self, ids):
+        """{usuario_id: nome}. Usa o cache e busca na API só até LIMITE_BUSCA_NOMES pessoas."""
+        nomes, buscas = {}, 0
+        for uid in ids:
+            usuario = self.bot.get_user(uid)
+            if usuario is None and buscas < LIMITE_BUSCA_NOMES:
+                buscas += 1
+                try:
+                    usuario = await self.bot.fetch_user(uid)
+                except discord.HTTPException:
+                    usuario = None
+            nomes[uid] = usuario.display_name if usuario else ""
+        return nomes
+
+    @commands.command(name="exportar", aliases=["export", "csv"], hidden=True)
+    @commands.guild_only()
+    @so_memi()
+    @commands.cooldown(1, 30, commands.BucketType.user)
+    async def exportar(self, ctx: commands.Context):
+        """Manda tudo que o bot guardou em planilhas CSV."""
+        async with ctx.typing():
+            tocadas = self.banco.historico_tocadas()
+            pedidos = self.banco.historico_pedidos()
+            if not tocadas and not pedidos:
+                await responder(
+                    ctx,
+                    "aviso",
+                    f"Ainda não tem nada guardado pra exportar (o dono precisa rodar `{PREFIX}read tudo`).",
+                )
+                return
+
+            musicas = self.banco.ranking_musicas()
+            artistas = self.banco.ranking_artistas()
+            usuarios = self.banco.ranking_usuarios()
+            nomes = await self.resolver_nomes([uid for uid, _ in usuarios])
+
+            def hora(message_id):
+                return data_local(message_id).strftime("%d/%m/%Y %H:%M:%S")
+
+            arquivos = [
+                discord.File(
+                    gerar_csv(
+                        ("posicao", "titulo", "artista", "vezes_tocada"),
+                        [(i, t, a, q) for i, (t, a, q) in enumerate(musicas, start=1)],
+                    ),
+                    filename="ranking_musicas.csv",
+                ),
+                discord.File(
+                    gerar_csv(
+                        ("posicao", "artista", "musicas_diferentes", "vezes_tocadas"),
+                        [(i, a, n, q) for i, (a, n, q) in enumerate(artistas, start=1)],
+                    ),
+                    filename="ranking_artistas.csv",
+                ),
+                discord.File(
+                    gerar_csv(
+                        ("posicao", "usuario_id", "nome", "pedidos"),
+                        [
+                            (i, uid, nomes.get(uid, ""), q)
+                            for i, (uid, q) in enumerate(usuarios, start=1)
+                        ],
+                    ),
+                    filename="ranking_usuarios.csv",
+                ),
+                discord.File(
+                    gerar_csv(
+                        ("data_hora", "titulo", "artista", "bot", "canal_id"),
+                        [(hora(mid), t, a, b or "", cid) for mid, t, a, b, cid in tocadas],
+                    ),
+                    filename="historico_tocadas.csv",
+                ),
+                discord.File(
+                    gerar_csv(
+                        ("data_hora", "usuario_id", "nome", "pedido", "canal_id"),
+                        [
+                            (hora(mid), uid, nomes.get(uid, ""), consulta_do_pedido(c) or "", cid)
+                            for mid, uid, c, cid in pedidos
+                        ],
+                    ),
+                    filename="historico_pedidos.csv",
+                ),
+            ]
+
+        try:
+            await ctx.send(
+                f"📊 **Planilhas prontas!** {len(tocadas)} músicas tocadas • {len(pedidos)} pedidos.\n"
+                "Separador `;` e horários em Brasília. O Excel abre direto; no Google Planilhas use "
+                "Arquivo → Importar.",
+                files=arquivos,
+            )
+        except discord.HTTPException:
+            await responder(
+                ctx,
+                "erro",
+                "Não consegui enviar: os arquivos passaram do limite de tamanho do Discord.",
+            )
+
+
+class PerfilView(discord.ui.View):
+    def __init__(self, paginas):
+        super().__init__(timeout=180)
+        self.paginas, self.pagina, self.message = paginas, 0, None
+        self.atualizar()
+
+    def atualizar(self):
+        self.anterior.disabled = self.pagina == 0
+        self.proxima.disabled = self.pagina == len(self.paginas) - 1
+
+    @discord.ui.button(label="◀", style=discord.ButtonStyle.secondary)
+    async def anterior(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.pagina = max(0, self.pagina - 1)
+        self.atualizar()
+        await interaction.response.edit_message(embed=self.paginas[self.pagina], view=self)
+
+    @discord.ui.button(label="▶", style=discord.ButtonStyle.secondary)
+    async def proxima(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.pagina = min(len(self.paginas) - 1, self.pagina + 1)
+        self.atualizar()
+        await interaction.response.edit_message(embed=self.paginas[self.pagina], view=self)
+
+    async def on_timeout(self):
+        for button in self.children:
+            button.disabled = True
+        if self.message:
+            try:
+                await self.message.edit(view=self)
+            except discord.HTTPException:
+                pass
+
+
+class Atividade(commands.Cog):
+    def __init__(self, bot):
+        self.bot = bot
+        self.musicas = bot.get_cog("Musicas")
+        self.banco = self.musicas.banco
+
+    async def cog_check(self, ctx):
+        return await self.musicas.cog_check(ctx)
+
+    @commands.command(name="scan", hidden=True)
+    @commands.guild_only()
+    @so_memi()
+    async def scan(self, ctx):
+        await self.musicas.iniciar_leitura(
+            ctx,
+            "🔎 Importando o histórico de todos os chats e threads, sem avisos...",
+            completo=True,
+        )
+
+    async def mostrar_ranking(self, ctx, titulo, linhas, unidade, subtitulo=""):
+        itens = [
+            f"**{self.musicas.nome_pessoa(uid)}** · {milhar(n)} {unidade}" for uid, n in linhas
+        ]
+        await self.musicas.enviar_ranking(
+            ctx,
+            titulo,
+            itens,
+            rodape_partes=(
+                f"{len(linhas)} participantes",
+                f"{milhar(sum(n for _, n in linhas))} {unidade}",
+                "rolls do Mudae não contam",
+            ),
+            subtitulo=subtitulo,
+            meu_indice=indice_do_usuario(linhas, ctx.author.id),
+        )
+
+    @commands.command(name="tagarelas", aliases=["tg"])
+    @commands.guild_only()
+    async def tagarelas(self, ctx, *args):
+        """Quem mais manda mensagem. Por padrão só pessoas; `bots` mostra os bots e `todos`
+        mistura os dois."""
+        filtros = {
+            "geral": None,
+            "todos": None,
+            "ios": False,
+            "pessoas": False,
+            "bot": True,
+            "bots": True,
+        }
+        filtros.update({sem_acento(nome): False for nome in NOMES_RANKING_USUARIO})
+        periodo = ""
+        tipos = []
+        for arg in args:
+            arg = sem_acento(arg)
+            if arg in ("mes", "ano") and not periodo:
+                periodo = arg
+            elif arg in filtros:
+                tipos.append(filtros[arg])
+            else:
+                await responder(ctx, "aviso", "Use mm!tagarelas [bots|todos] [mes|ano].")
+                return
+        if len(set(tipos)) > 1:
+            await responder(ctx, "aviso", "Escolha só um: pessoas (padrão), bots ou todos.")
+            return
+        filtro = tipos[0] if tipos else False
+        desde, rotulo = intervalo(periodo)
+        linhas = self.musicas.ranking("mensagens", desde, filtro)
+        titulo = "🤖 Bots que mais mandaram mensagem" if filtro else "💬 Quem mais mandou mensagem"
+        await self.mostrar_ranking(ctx, titulo, linhas, "mensagens", subtitulo=rotulo)
+
+    @commands.command(name="hall", aliases=["halldafama", "h"])
+    @commands.guild_only()
+    async def hall(self, ctx, *args):
+        palavras = [sem_acento(x) for x in args]
+        if palavras not in ([], ["mes"], ["meses"], ["ano"], ["anos"]):
+            await responder(ctx, "aviso", "Use mm!hall [mes|ano].")
+            return
+        tipo = "ano" if palavras and palavras[0].startswith("ano") else "mes"
+
+        def quem(uid):
+            if uid is None:
+                return "—"
+            return f"**{cortar(self.musicas.nome_pessoa(uid), HALL_NOME_MAXIMO)}**"
+
+        dj, resenhex = tags.icone(f"dj_{tipo}"), tags.icone(f"tagarela_{tipo}")
+        itens = [
+            f"**{rotulo_periodo(tipo, periodo)}**\n"
+            f"{dj} DJ · {quem(uid_dj)}\n{resenhex} Resenhex · {quem(uid_tagarela)}"
+            for periodo, uid_dj, uid_tagarela in self.banco.hall(tipo)
+        ]
+        await self.musicas.enviar_ranking(
+            ctx,
+            "🏛️ Hall da fama",
+            itens,
+            subtitulo="anos" if tipo == "ano" else "meses",
+            rodape_partes=(plural(len(itens), "período", "períodos"),),
+            numerar=False,
+            por_pagina=HALL_POR_PAGINA,
+            separador="\n\n",
+        )
+
+    @commands.command(name="levels", aliases=["lvl", "niveis", "níveis"])
+    @commands.guild_only()
+    async def levels(self, ctx, *args):
+        if args:
+            await responder(ctx, "aviso", "mm!levels usa o total histórico, sem flags.")
+            return
+        linhas = self.banco.ranking_xp(False, self.musicas.elegiveis())
+        itens = []
+        for uid, xp in linhas:
+            n = progressao.nivel(xp)
+            patente = progressao.patente(n)
+            itens.append(
+                f"**{self.musicas.nome_pessoa(uid)}** · Nv. {n} · "
+                f"{tags.icone(tags.id_patente(patente))} {patente['nome']} · {milhar(xp)} XP"
+            )
+        await self.musicas.enviar_ranking(
+            ctx,
+            "🏆 Ranking de níveis",
+            itens,
+            rodape_partes=(
+                f"{len(linhas)} participantes",
+                "XP: 1 por mensagem, 25 por música, ½ por roletada",
+            ),
+            meu_indice=indice_do_usuario(linhas, ctx.author.id),
+        )
+
+    # ----- Mudae -------------------------------------------------------------
+    def _aviso_mudae(self):
+        if self.banco.estado("mudae_historico") != "1":
+            return f"{emoji_simples('importando')} lendo o histórico do Mudae"
+        return ""
+
+    def _topo(self, linhas, formatar, limite=5):
+        return (
+            "\n".join(
+                f"{MEDALHAS[i] if i < 3 else '·'} {formatar(x)}"
+                for i, x in enumerate(linhas[:limite])
+            )
+            or "Ainda não há rolls registrados."
+        )
+
+    def embed_panorama_mudae(self):
+        nome = self.musicas.nome_pessoa
+        elegiveis = self.musicas.elegiveis()
+
+        def ranking(tipo, limite=None):
+            linhas = mudae_tracker.ranking(self.banco.con, tipo, limite=limite)
+            if tipo == "ios" and elegiveis is not None:
+                linhas = [x for x in linhas if x[0] in elegiveis]
+            return linhas
+
+        embed = discord.Embed(title=f"{emoji_simples('mudae')} Rankings do Mudae", color=COR_PADRAO)
+        embed.description = "Top 5 dos rolls registrados após comandos do Mudae."
+        campo(
+            embed,
+            "📱 IOS · usuários",
+            self._topo(ranking("ios", 5), lambda x: f"**{nome(x[0])}** · {x[1]} rolls"),
+            False,
+        )
+        campo(
+            embed,
+            "⭐ Personagens",
+            self._topo(ranking("personagens", 5), lambda x: f"**{x[0][:50]}** · {x[2]}x"),
+            False,
+        )
+        campo(
+            embed,
+            "📚 Séries",
+            self._topo(ranking("series", 5), lambda x: f"**{x[0][:50]}** · {x[1]}x"),
+            False,
+        )
+        embed.set_footer(
+            text=rodape_do_bot(
+                "mm!mudae ios", "mm!mudae personagens", "mm!mudae series", self._aviso_mudae()
+            )
+        )
+        return embed
+
+    @commands.group(
+        name="mudae", aliases=["md"], invoke_without_command=True, case_insensitive=True
+    )
+    @commands.guild_only()
+    async def mudae(self, ctx):
+        """Resumo top 5 dos usuários IOS, personagens e séries do Mudae."""
+        embed = self.embed_panorama_mudae()
+        await ctx.send(embed=embed, allowed_mentions=discord.AllowedMentions.none())
+
+    async def _ranking_mudae(self, ctx, tipo):
+        linhas = mudae_tracker.ranking(self.banco.con, tipo)
+        titulo, itens = "", []
+        por_pessoa = {
+            "casamentos": ("💍 Quem mais casou", "casamento", "casamentos"),
+            "kakera": ("💎 Quem mais coletou kakera", "kakera", "kakera"),
+            "snipers": ("🎯 Maiores snipers", "snipe", "snipes"),
+            "azarados": ("🍀 Rolaram muito, casaram pouco", "roll sem casar", "rolls sem casar"),
+        }
+        if tipo in por_pessoa:
+            elegiveis = self.musicas.elegiveis()
+            if elegiveis is not None:
+                linhas = [x for x in linhas if x[0] in elegiveis]
+            titulo, um, varios = por_pessoa[tipo]
+            itens = [
+                f"**{self.musicas.nome_pessoa(uid)}** · {plural(n, um, varios)}" for uid, n in linhas
+            ]
+        elif tipo == "ios":
+            elegiveis = self.musicas.elegiveis()
+            if elegiveis is not None:
+                linhas = [x for x in linhas if x[0] in elegiveis]
+            titulo = "📱 Ranking IOS · usuários"
+            itens = [
+                f"**{self.musicas.nome_pessoa(uid)}** · {plural(n, 'roll', 'rolls')}"
+                for uid, n in linhas
+            ]
+        elif tipo == "personagens":
+            titulo = "⭐ Personagens mais roletados"
+            itens = [f"**{nome[:60]}** · {quantidade}x" for nome, _, quantidade in linhas]
+        else:
+            titulo = "📚 Séries mais roletadas"
+            itens = [f"**{nome[:60]}** · {quantidade}x" for nome, quantidade in linhas]
+        await self.musicas.enviar_ranking(
+            ctx,
+            titulo,
+            itens,
+            rodape_partes=(f"{len(linhas)} no ranking", self._aviso_mudae()),
+            meu_indice=(
+                indice_do_usuario(linhas, ctx.author.id)
+                if tipo == "ios" or tipo in por_pessoa
+                else None
+            ),
+        )
+
+    @mudae.command(name="ios", aliases=["usuarios", "usuários"])
+    async def mudae_ios(self, ctx):
+        await self._ranking_mudae(ctx, "ios")
+
+    @mudae.command(name="personagens", aliases=["chars", "waifus"])
+    async def mudae_personagens(self, ctx):
+        await self._ranking_mudae(ctx, "personagens")
+
+    @mudae.command(name="series", aliases=["séries"])
+    async def mudae_series(self, ctx):
+        await self._ranking_mudae(ctx, "series")
+
+    @mudae.command(name="casamentos", aliases=["casados"])
+    async def mudae_casamentos(self, ctx):
+        await self._ranking_mudae(ctx, "casamentos")
+
+    @mudae.command(name="kakera")
+    async def mudae_kakera(self, ctx):
+        await self._ranking_mudae(ctx, "kakera")
+
+    @mudae.command(name="snipes", aliases=["snipers"])
+    async def mudae_snipes(self, ctx):
+        await self._ranking_mudae(ctx, "snipers")
+
+    @mudae.command(name="azar", aliases=["azarados"])
+    async def mudae_azar(self, ctx):
+        await self._ranking_mudae(ctx, "azarados")
+
+    @mudae.command(name="personagem", aliases=["char"])
+    async def mudae_personagem(self, ctx, *, nome: str):
+        dados = mudae_tracker.personagem(self.banco.con, nome)
+        if dados is None:
+            await responder(ctx, "aviso", "Esse personagem ainda não saiu nos rolls.")
+            return
+        embed = discord.Embed(title=f"⭐ {dados['nome']}"[:256], color=COR_PADRAO)
+        campo(embed, "Série", dados["serie"], False)
+        campo(embed, "Vezes roletado", milhar(dados["vezes"]))
+        if dados["claims"]:
+            campo(embed, "Melhor rank", f"#{milhar(dados['claims'])}")
+        if dados["maior_kakera"]:
+            campo(embed, "Maior valor", milhar(dados["maior_kakera"]))
+        nome_de = self.musicas.nome_pessoa
+        campo(
+            embed,
+            "Quem mais rolou",
+            "\n".join(f"**{nome_de(u)}** · {n}x" for u, n in dados["roletadores"]),
+            False,
+        )
+        campo(
+            embed,
+            "Casamentos",
+            cortar(
+                ", ".join(nome_de(u) if u else n for u, n in dados["casamentos"]), LIMITE_CAMPO
+            ),
+            False,
+        )
+        await ctx.send(embed=embed, allowed_mentions=discord.AllowedMentions.none())
+
+    @mudae.command(name="eu", aliases=["perfil"])
+    async def mudae_eu(self, ctx, pessoa: discord.Member = None):
+        pessoa = pessoa or ctx.author
+        dados = mudae_tracker.perfil(self.banco.con, pessoa.id)
+        embed = discord.Embed(title=f"🎎 Mudae de {pessoa.display_name}"[:256], color=COR_PADRAO)
+        campo(embed, "Rolls", milhar(dados["rolls"]))
+        campo(embed, "Casamentos", milhar(dados["casamentos"]))
+        campo(embed, "Aproveitamento", f"{dados['aproveitamento']}%")
+        campo(embed, "Kakera", milhar(dados["kakera"]))
+        campo(embed, "Snipes feitos", milhar(dados["snipes"]))
+        campo(embed, "Snipes sofridos", milhar(dados["sofridos"]))
+        if dados["favorito"]:
+            campo(embed, "Mais roletado", f"{dados['favorito'][0]} · {dados['favorito'][1]}x", False)
+        if dados["maior_casamento"]:
+            campo(
+                embed,
+                "Maior casamento",
+                f"{dados['maior_casamento'][0]} · {milhar(dados['maior_casamento'][1])} kakera",
+                False,
+            )
+        await ctx.send(embed=embed, allowed_mentions=discord.AllowedMentions.none())
+
+    @commands.command(name="mudaedump", hidden=True)
+    @commands.guild_only()
+    @so_memi()
+    @commands.cooldown(1, 30, commands.BucketType.user)
+    async def mudaedump(self, ctx, *args):
+        """Exporta as últimas mensagens do Mudae de um canal em JSON (calibração do tracker)."""
+        canal, quantidade = getattr(ctx, "channel", None), 300
+        for arg in args:
+            achado = re.fullmatch(r"(?:<#)?(\d{15,21})>?", arg)
+            if achado:
+                canal = ctx.guild.get_channel_or_thread(int(achado[1]))
+            elif arg.isdigit():
+                quantidade = max(1, min(2000, int(arg)))
+        if canal is None or not hasattr(canal, "history"):
+            await responder(ctx, "aviso", "Use mm!mudaedump [#canal] [quantidade até 2000].")
+            return
+        amostras, contagem = [], Counter()
+        async with ctx.typing():
+            async for msg in canal.history(limit=quantidade):
+                do_mudae = mudae_tracker.eh_do_mudae(msg)
+                if not do_mudae and not eh_mudae(msg):
+                    continue
+                tipo = mudae_tracker.tipo_de(msg) if do_mudae else "comando"
+                contagem[tipo or "não reconhecida"] += 1
+                interacao = getattr(getattr(msg, "interaction_metadata", None), "user", None)
+                amostras.append(
+                    {
+                        "id": msg.id,
+                        "quando": data_local(msg.id).isoformat(),
+                        "autor": {
+                            "id": msg.author.id,
+                            "nome": msg.author.name,
+                            "bot": msg.author.bot,
+                        },
+                        "entendido_como": tipo,
+                        "conteudo": msg.content,
+                        "embeds": [e.to_dict() for e in msg.embeds],
+                        "botoes": [
+                            {
+                                "emoji": str(getattr(b, "emoji", "") or ""),
+                                "rotulo": getattr(b, "label", None),
+                                "desativado": getattr(b, "disabled", None),
+                            }
+                            for linha in getattr(msg, "components", []) or []
+                            for b in getattr(linha, "children", []) or []
+                        ],
+                        "interacao_de": getattr(interacao, "id", None),
+                        "editada": getattr(msg, "edited_at", None) is not None,
+                    }
+                )
+        arquivo = discord.File(
+            io.BytesIO(json.dumps(amostras[::-1], ensure_ascii=False, indent=1).encode("utf-8")),
+            filename="mudae_amostras.json",
+        )
+        resumo = " · ".join(f"{t}: {n}" for t, n in contagem.most_common()) or "nada do Mudae"
+        await ctx.send(
+            f"{EMOJI['mudae']} {len(amostras)} mensagens do Mudae e comandos em "
+            f"{quantidade} lidas. {resumo}",
+            file=arquivo,
+        )
+
+    @commands.command(name="give", hidden=True)
+    @commands.guild_only()
+    @so_memi()
+    async def give(self, ctx, *, texto: str = ""):
+        """mm!give @pessoa TAG[, TAG...] (também aceita o formato antigo com titulo)."""
+        palavras = texto.split()
+        if palavras and sem_acento(palavras[0]) in ("titulo", "insignia", "tag"):
+            palavras = palavras[1:]
+        alvo, resto = None, []
+        for palavra in palavras:
+            achado = re.fullmatch(r"<@!?(\d+)>|(\d{15,21})", palavra)
+            if achado and alvo is None:
+                alvo = int(achado[1] or achado[2])
+            else:
+                resto.append(palavra)
+        manuais = ", ".join(CATALOGO[k]["nome"] for k in tags.manuais())
+        if alvo is None or not resto:
+            await responder(ctx, "aviso", f"Use mm!give @pessoa TAG. Tags manuais: {manuais}.")
+            return
+        pessoa = ctx.guild.get_member(alvo)
+        if pessoa is None:  # sem a Server Members Intent o cache pode não ter a pessoa
+            try:
+                pessoa = await ctx.guild.fetch_member(alvo)
+            except discord.HTTPException:
+                await responder(ctx, "aviso", "Não achei essa pessoa no servidor.")
+                return
+        identificadores = []
+        manual = set(tags.manuais())
+        erro_tags = "Tag inexistente ou automática. Tags manuais: " + ", ".join(
+            CATALOGO[k]["nome"] for k in tags.manuais()
+        )
+        for parte in " ".join(resto).replace(";", ",").split(","):
+            tokens = parte.split()
+            while tokens:
+                encontrado = None
+                tamanho = len(tokens)
+                while tamanho:
+                    candidato = tags.buscar(" ".join(tokens[:tamanho]))
+                    if candidato is not None:
+                        if candidato not in manual:
+                            await responder(ctx, "erro", erro_tags)
+                            return
+                        encontrado = candidato, tamanho
+                        break
+                    tamanho -= 1
+                if encontrado is None:
+                    await responder(ctx, "erro", erro_tags)
+                    return
+                ident, tamanho = encontrado
+                identificadores.append(ident)
+                tokens = tokens[tamanho:]
+        try:
+            resultados = [
+                (ident, self.banco.conceder_manual(pessoa.id, CATALOGO[ident]["nome"], pessoa.bot))
+                for ident in identificadores
+            ]
+        except ValueError as erro:
+            await responder(ctx, "erro", str(erro)[:1900])
+            return
+        nome = discord.utils.escape_markdown(pessoa.display_name)
+        concedidas = [tags.rotulo(ident) for ident, novo in resultados if novo]
+        existentes = [tags.rotulo(ident) for ident, novo in resultados if not novo]
+        if concedidas:
+            mensagem = f"Tags concedidas a **{nome}**: {', '.join(concedidas)}."
+            if existentes:
+                mensagem += f" Já possuía: {', '.join(existentes)}."
+            await responder(ctx, "sucesso", mensagem)
+        else:
+            await responder(ctx, "aviso", f"**{nome}** já possui {', '.join(existentes)}.")
+
+    def embed_tags(self, pessoa):
+        posses = self.banco.tags_usuario(pessoa.id)
+        embed = discord.Embed(title=f"🏷️ Tags de {pessoa.display_name}"[:256], color=COR_PADRAO)
+        if posses:
+            embed.description = juntar_ate(
+                blocos_por_categoria(posses),
+                LIMITE_DESCRICAO,
+                "\n\n",
+                "\n\n+{n} categorias",
+            )
+            total = sum(n for _, n, _ in posses)
+            embed.set_footer(
+                text=rodape_do_bot(
+                    plural(len(posses), "tag", "tags"),
+                    f"{milhar(total)} no total" if total != len(posses) else "",
+                    "mm!tags todos",
+                )
+            )
+        else:
+            embed.description = "NÃO POSSUI TÍTULOS OU INSÍGNIAS"
+            embed.set_footer(text=rodape_do_bot("mm!tags todos mostra como ganhar"))
+        return embed
+
+    def paginas_catalogo(self, uid):
+        """Uma página por categoria, marcando com ✅ as tags que a pessoa já tem."""
+        tem = {item for item, _, _ in self.banco.tags_usuario(uid)}
+        paginas = []
+        for i, categoria in enumerate(tags.CATEGORIAS, 1):
+            linhas = [
+                f"{'✅' if item in tem else '▫️'} {tags.icone(item)} **{info['nome']}** — "
+                f"{'???' if info['oculta'] and item not in tem else info['como']}"
+                + (" · dada pelo dono" if info["manual"] else "")
+                for item, info in CATALOGO.items()
+                if info["categoria"] == categoria
+            ]
+            embed = discord.Embed(
+                title=f"🏷️ Todas as tags · {categoria}",
+                description=cortar("\n".join(linhas), LIMITE_DESCRICAO),
+                color=COR_PADRAO,
+            )
+            embed.set_footer(text=rodape_do_bot(f"{i}/{len(tags.CATEGORIAS)}", "✅ você já tem"))
+            paginas.append(embed)
+        return paginas
+
+    @commands.command(
+        name="tags",
+        aliases=["t", "titulos", "títulos", "insignias", "insígnias", "i"],
+    )
+    @commands.guild_only()
+    async def tags(self, ctx, *, alvo: str = ""):
+        """Tags (títulos e insígnias) de alguém; `mm!tags todos` mostra todas e como ganhar."""
+        if sem_acento(alvo) in ("todos", "todas", "help", "ajuda", "lista", "catalogo"):
+            await self.enviar_catalogo(ctx)
+            return
+        pessoa = ctx.author
+        if alvo:
+            try:
+                pessoa = await commands.MemberConverter().convert(ctx, alvo)
+            except commands.BadArgument:
+                await responder(ctx, "aviso", "Use mm!tags [@pessoa] ou mm!tags todos.")
+                return
+        await ctx.send(
+            embed=self.embed_tags(pessoa), allowed_mentions=discord.AllowedMentions.none()
+        )
+
+    @commands.command(name="th", hidden=True)
+    @commands.guild_only()
+    async def th(self, ctx):
+        """Atalho de mm!tags todos."""
+        await self.enviar_catalogo(ctx)
+
+    async def enviar_catalogo(self, ctx):
+        view = PerfilView(self.paginas_catalogo(ctx.author.id))
+        view.message = await ctx.send(
+            embed=view.paginas[0], view=view, allowed_mentions=discord.AllowedMentions.none()
+        )
+
+    @commands.command(name="cartao", aliases=["cartão", "card", "c"])
+    @commands.guild_only()
+    @commands.cooldown(1, 10, commands.BucketType.user)
+    async def cartao(self, ctx, pessoa: discord.Member = None):
+        """Cartão de perfil em imagem (precisa do Pillow; sem ele mostra o perfil comum)."""
+        pessoa = pessoa or ctx.author
+        if not imagens.disponivel():
+            await responder(
+                ctx,
+                "aviso",
+                "O cartão em imagem precisa do Pillow "
+                "(`python -m pip install -r requirements.txt`). Mostrando o perfil comum.",
+            )
+            await Musicas.perfil.callback(self.musicas, ctx, pessoa)
+            return
+        if not pode_anexar(getattr(ctx, "channel", None)):
+            await responder(
+                ctx,
+                "aviso",
+                "Preciso da permissão de anexar arquivos neste canal para mostrar o cartão. "
+                "Mostrando o perfil comum.",
+            )
+            await Musicas.perfil.callback(self.musicas, ctx, pessoa)
+            return
+        async with ctx.typing():
+            avatar = await self.musicas.baixar_avatar(pessoa)
+            dados = self.musicas.dados_cartao(pessoa)
+            arquivo = await self.musicas.gerar_imagem(
+                imagens.gerar_cartao, "cartao.png", dados, avatar
+            )
+        if arquivo is None:
+            await responder(ctx, "erro", "Não consegui gerar o cartão agora. Tente de novo.")
+            return
+        # Anexo solto (sem embed): o Discord mostra a imagem maior.
+        await ctx.send(file=arquivo, allowed_mentions=discord.AllowedMentions.none())
+
+    @commands.command(name="frase", aliases=["f"])
+    @commands.guild_only()
+    async def frase(self, ctx, *, texto: str = ""):
+        if len(texto) > 100:
+            await responder(ctx, "aviso", "A frase pode ter no máximo 100 caracteres.")
+            return
+        self.banco.salvar_perfil(ctx.author.id, frase=texto)
+        await responder(ctx, "sucesso", "Frase salva.")
+
+    @commands.command(name="favorita", aliases=["fm"])
+    @commands.guild_only()
+    async def favorita(self, ctx, *, texto: str):
+        texto = texto.strip()
+        if not texto or len(texto) > 200:
+            await responder(
+                ctx, "aviso", "Use o nome da música e do artista, com até 200 caracteres."
+            )
+            return
+        titulo, artista = dividir(texto, RE_TRACO)
+        async with ctx.typing():
+            capa, _ = await self.musicas.deezer.info_seguro(texto, titulo, artista)
+        self.banco.salvar_perfil(ctx.author.id, favorita=texto, capa=capa)
+        await responder(
+            ctx,
+            "sucesso",
+            (
+                "Música favorita salva. Capa encontrada no Deezer."
+                if capa
+                else "Música favorita salva. Não encontrei a capa no Deezer agora."
+            ),
+        )
+
+    @commands.command(name="ec", aliases=["embedcolor"])
+    @commands.guild_only()
+    async def ec(self, ctx, *, texto: str = ""):
+        """Troca a cor do embed do seu perfil (mm!ec COR)."""
+        uso = (
+            f"Use `{PREFIX}ec COR`, com um código hex (`#ff8800`) ou um nome ("
+            + ", ".join(CORES)
+            + f"). `{PREFIX}ec padrao` volta à cor original."
+        )
+        if not texto.strip():
+            await responder(ctx, "aviso", uso)
+            return
+        try:
+            cor = interpretar_cor(texto)
+        except ValueError:
+            await responder(ctx, "erro", "Cor inválida. " + uso)
+            return
+        self.banco.salvar_perfil(ctx.author.id, cor=cor)
+        await responder(
+            ctx,
+            "sucesso",
+            (
+                "Cor do perfil restaurada."
+                if cor is None
+                else f"Cor do perfil atualizada para `#{cor:06X}`."
+            ),
+        )
+
+    @commands.command(name="titulo", aliases=["título"])
+    @commands.guild_only()
+    async def titulo(self, ctx, *, nome: str):
+        if self.banco.selecionar_titulo(ctx.author.id, nome):
+            await responder(ctx, "sucesso", "Título favorito atualizado.")
+        else:
+            await responder(ctx, "aviso", "Você não possui essa tag. Veja as suas com mm!tags.")
+
+
+AJUDA = [
+    (
+        "🏆 Rankings",
+        [
+            ("mm!tagarelas", "mensagens · flags: bots, todos, mes, ano"),
+            ("mm!levels", "níveis, patentes e XP"),
+            ("mm!hall", "vencedores dos meses anteriores · flag: ano"),
+        ],
+    ),
+    (
+        "🎵 Música",
+        [
+            ("mm!musicas", "flags: artista, ios, genero, mes, ano"),
+            ("mm!aleatoria", "sorteia uma música"),
+            ("mm!wrapped", "seu resumo dos últimos 12 meses"),
+        ],
+    ),
+    (
+        "🎎 Mudae",
+        [
+            ("mm!mudae", "resumo top 5: usuários IOS, personagens e séries"),
+            ("mm!mudae ios", "ranking de usuários IOS por quantidade de rolls"),
+            ("mm!mudae personagens", "personagens mais roletados"),
+            ("mm!mudae series", "séries mais roletadas"),
+            ("mm!mudae casamentos / kakera / snipes / azar", "mais rankings do Mudae"),
+            ("mm!mudae eu [@pessoa]", "seus números no Mudae"),
+            ("mm!mudae personagem NOME", "tudo sobre um personagem"),
+        ],
+    ),
+    (
+        "👤 Perfil e tags",
+        [
+            ("mm!perfil [@pessoa]", "perfil em 3 páginas"),
+            ("mm!cartao [@pessoa]", "cartão de perfil em imagem"),
+            ("mm!tags [@pessoa]", "títulos e insígnias conquistados"),
+            ("mm!tags todos", "todas as tags e como ganhar cada uma"),
+        ],
+    ),
+    (
+        "🎨 Personalização",
+        [
+            ("mm!favorita MÚSICA - ARTISTA", "sua música favorita"),
+            ("mm!titulo NOME", "escolhe o título exibido no perfil"),
+            ("mm!frase TEXTO", "frase de até 100 caracteres"),
+            ("mm!ec COR", "cor do perfil (#hex ou nome; padrao restaura)"),
+        ],
+    ),
+    (
+        "🎮 Diversão",
+        [
+            ("mm!quiz", "quem canta? ponto para o primeiro que acertar · mm!quiz top"),
+            ("mm!duelo @pessoa", "duelo do mês, valendo tag · sem pessoa mostra os seus"),
+            ("mm!comparar @pessoa", "seus números lado a lado com os de alguém"),
+            ("mm!sequencia [@pessoa]", "dias seguidos conversando"),
+            ("mm!nestedia", "o que rolou nesta data nos anos anteriores"),
+        ],
+    ),
+    (
+        "ℹ️ Sobre o bot",
+        [("mm!changelog", "o que mudou em cada versão")],
+    ),
+]
+
+class ChangelogView(discord.ui.View):
+    """Uma versão do histórico com um menu para trocar de versão (também as passadas)."""
+
+    def __init__(self, indice=0):
+        super().__init__(timeout=180)
+        self.indice = indice
+        self.message = None
+        self.select = discord.ui.Select(placeholder="Ver outra versão", options=self._opcoes())
+        self.select.callback = self._escolheu
+        self.add_item(self.select)
+
+    def _opcoes(self):
+        return [
+            discord.SelectOption(
+                label=f"v{entrada['versao']}",
+                description=" · ".join(x for x in (entrada["data"], entrada["titulo"]) if x)[:100],
+                value=str(i),
+                default=i == self.indice,
+            )
+            for i, entrada in enumerate(versoes_bot.VERSOES[:25])
+        ]
+
+    def montar_embed(self):
+        return embed_changelog(
+            versoes_bot.VERSOES[self.indice], self.indice, len(versoes_bot.VERSOES)
+        )
+
+    async def trocar(self, interaction, indice):
+        self.indice = indice
+        for i, opcao in enumerate(self.select.options):
+            opcao.default = i == indice
+        await interaction.response.edit_message(embed=self.montar_embed(), view=self)
+
+    async def _escolheu(self, interaction):
+        await self.trocar(interaction, int(self.select.values[0]))
+
+    async def on_timeout(self):
+        self.select.disabled = True
+        if self.message:
+            try:
+                await self.message.edit(view=self)
+            except discord.HTTPException:
+                pass
+
+
+class AjudaView(discord.ui.View):
+    """Navegação entre páginas da lista de comandos."""
+
+    def __init__(self, secoes_por_pagina):
+        super().__init__(timeout=180)
+        self.paginas = [
+            embed_ajuda(
+                secoes,
+                pagina=pagina,
+                total_paginas=len(secoes_por_pagina),
+            )
+            for pagina, secoes in enumerate(secoes_por_pagina)
+        ]
+        self.pagina = 0
+        self.message = None
+        self._atualizar_botoes()
+
+    def _atualizar_botoes(self):
+        self.anterior.disabled = self.pagina == 0
+        self.proxima.disabled = self.pagina == len(self.paginas) - 1
+
+    @discord.ui.button(label="◀", style=discord.ButtonStyle.secondary)
+    async def anterior(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.pagina = max(0, self.pagina - 1)
+        self._atualizar_botoes()
+        await interaction.response.edit_message(
+            embed=self.paginas[self.pagina],
+            view=self,
+        )
+
+    @discord.ui.button(label="▶", style=discord.ButtonStyle.secondary)
+    async def proxima(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.pagina = min(len(self.paginas) - 1, self.pagina + 1)
+        self._atualizar_botoes()
+        await interaction.response.edit_message(
+            embed=self.paginas[self.pagina],
+            view=self,
+        )
+
+    async def on_timeout(self):
+        for button in self.children:
+            button.disabled = True
+        if self.message:
+            try:
+                await self.message.edit(view=self)
+            except discord.HTTPException:
+                pass
+
+
+class Ajuda(commands.Cog):
+    @commands.command(name="help", aliases=["ajuda", "comandos"])
+    async def ajuda(self, ctx, comando: str = ""):
+        if comando:
+            await responder(ctx, "aviso", f"Não achei o comando `{comando[:30]}`.")
+            return
+        view = AjudaView([AJUDA])
+        embed = view.paginas[0]
+        musicas = self.bot.get_cog("Musicas") if self.bot else None
+        arquivo = None
+        if musicas:
+            arquivo = await musicas.gerar_imagem(
+                imagens.gerar_ajuda, "ajuda.png", canal=getattr(ctx, "channel", None)
+            )
+        if arquivo is None:
+            view.message = await ctx.send(embed=embed, view=view)
+            return
+        embed.set_image(url="attachment://ajuda.png")
+        view.message = await ctx.send(embed=embed, file=arquivo, view=view)
+
+    @commands.command(name="changelog", aliases=["novidades", "versao", "versão", "cl"])
+    async def changelog(self, ctx, versao: str = ""):
+        """Mudanças da versão mais recente; `mm!changelog 2.0.0` ou o menu mostram as anteriores."""
+        indice = versoes_bot.buscar(versao) if versao else 0
+        if indice is None:
+            disponiveis = ", ".join(f"`{v['versao']}`" for v in versoes_bot.VERSOES)
+            await responder(
+                ctx, "aviso", f"Não achei a versão `{versao[:20]}`. Disponíveis: {disponiveis}."
+            )
+            return
+        view = ChangelogView(indice)
+        view.message = await ctx.send(
+            embed=view.montar_embed(), view=view, allowed_mentions=discord.AllowedMentions.none()
+        )
+
+    @commands.command(name="reiniciar", aliases=["restart", "reboot"], hidden=True)
+    @so_memi()
+    async def reiniciar(self, ctx):
+        """Fecha o bot com calma e abre de novo (só o dono)."""
+        await responder(ctx, "sucesso", "🔄 Reiniciando... volto em alguns segundos.")
+        pedir_reinicio()
+
+    def __init__(self, bot):
+        self.bot = bot
+
+
+# Adicione novas funcionalidades aqui (cada uma como um Cog separado)
+COGS = [Musicas, Atividade, Ajuda, extras.Extras]  # a ordem importa: usam o banco do Musicas
+
+
+class MeMiBot(commands.Bot):
+    async def setup_hook(self):
+        for cog in COGS:
+            await self.add_cog(cog(self))
+
+    async def get_context(self, origin, *, cls=commands.Context):
+        """Aceita o comando com ou sem acento (mm!tática = mm!tatica)."""
+        ctx = await super().get_context(origin, cls=cls)
+        if ctx.command is None and ctx.invoked_with:
+            ctx.command = self.all_commands.get(sem_acento(ctx.invoked_with))
+        return ctx
+
+    async def on_ready(self):
+        # Registra os comandos de barra da comunidade uma vez por execução.
+        if not getattr(self, "_barra_sincronizada", False):
+            self._barra_sincronizada = True
+            try:
+                registrados = await self.tree.sync()
+                logging.info("Comandos de barra registrados: %s", len(registrados))
+            except discord.HTTPException:
+                logging.exception("Não consegui registrar os comandos de barra.")
+        await self.change_presence(activity=discord.Game(name=f"{PREFIX}help"))
+        logging.info("%s v%s online como %s", BOT_NAME, versoes_bot.VERSAO_ATUAL, self.user)
+
+    async def on_command_error(self, ctx, error):
+        if isinstance(error, commands.CommandNotFound):
+            return
+        if isinstance(error, commands.NoPrivateMessage):
+            await responder(ctx, "aviso", "Esse comando só funciona dentro de um servidor.")
+            return
+        if isinstance(error, commands.CommandOnCooldown):
+            await responder(ctx, "aviso", f"Calma! Tente de novo em {error.retry_after:.0f}s.")
+            return
+        if isinstance(error, commands.CheckFailure):
+            await responder(ctx, "erro", str(error))
+            return
+        if isinstance(error, commands.MissingRequiredArgument):
+            await responder(
+                ctx,
+                "aviso",
+                f"Faltou um argumento. Use `mm!{ctx.command.qualified_name} {ctx.command.signature}`",
+            )
+            return
+        if isinstance(error, commands.BadArgument):
+            await responder(ctx, "aviso", f"Não entendi esse argumento. Veja `{PREFIX}help`.")
+            return
+        logging.error(
+            "Erro no comando %s", ctx.command, exc_info=(type(error), error, error.__traceback__)
+        )
+        await responder(
+            ctx, "erro", "Não consegui concluir o comando. O erro ficou salvo no memi_bot.log."
+        )
+
+
+def criar_intents(membros):
+    intents = discord.Intents.default()
+    intents.members = membros
+    intents.message_content = True  # ative também no Developer Portal!
+    return intents
+
+
+def prefixo(bot, message):
+    """Aceita `mm!` em qualquer combinação de maiúsculas (MM!, Mm!…)."""
+    prefixos = commands.when_mentioned(bot, message)
+    for aceito in (PREFIX,):
+        inicio = (message.content or "")[: len(aceito)]
+        if inicio.lower() == aceito.lower():
+            prefixos.append(inicio)  # devolve exatamente o que a pessoa digitou
+    return prefixos
+
+
+def criar_bot(membros=MEMBERS_INTENT):
+    # case_insensitive: também aceita o nome do comando em maiúsculas (mm!RANKING, mm!Perfil...)
+    return MeMiBot(
+        command_prefix=prefixo,
+        case_insensitive=True,
+        strip_after_prefix=True,
+        intents=criar_intents(membros),
+        help_command=None,
+        allowed_mentions=discord.AllowedMentions.none(),
+    )
+
+
+bot = criar_bot(MEMBERS_INTENT)
+
+
+def executar():
+    """Roda o bot até o fim. Ctrl+C encerra sem traceback."""
+    try:
+        asyncio.run(conectar())
+    except KeyboardInterrupt:
+        pass
+    except discord.PrivilegedIntentsRequired:
+        logging.error(MSG_INTENT_MENSAGENS)
+        raise SystemExit(MSG_INTENT_MENSAGENS)
+    except Exception:
+        logging.exception("O bot não pôde continuar.")
+        raise
+
+
+async def conectar():
+    """Conecta o bot. Se o Discord recusar a Server Members Intent (não ativada no portal), segue
+    sem ela em vez de falhar: a atualização não deve exigir nenhum passo manual."""
+    global bot
+    REINICIO["loop"] = asyncio.get_running_loop()
+    try:
+        async with bot:
+            await bot.start(TOKEN)
+    except discord.PrivilegedIntentsRequired:
+        if not bot.intents.members:
+            raise  # a recusada foi outra intent; não há alternativa
+        logging.warning(MSG_INTENT_MEMBROS)
+        bot = criar_bot(False)
+        async with bot:
+            await bot.start(TOKEN)
+
+
+if __name__ == "__main__":
+    configurar_log()
+    if not TOKEN or TOKEN == "COLE_SEU_TOKEN_AQUI":
+        logging.error("Falta configurar token.txt na mesma pasta do bot.")
+        raise SystemExit(
+            'Falta o token! Abra o arquivo "token.txt" (na mesma pasta do bot) '
+            "e troque COLE_SEU_TOKEN_AQUI pelo seu token (só o token, sem aspas)."
+        )
+    if ARG_PEDIR_REINICIO in sys.argv and mandar_reinicio():
+        raise SystemExit("Pedido de reinício enviado ao MeMi BOT.")
+    if problemas_config():
+        texto_config = "config.json incompleto: faltam " + "; ".join(problemas_config())
+        logging.error(texto_config)
+        raise SystemExit(texto_config)
+    # a referência precisa continuar viva enquanto o bot rodar
+    trava = travar_instancia(espera=espera_trava())
+    if trava is None:
+        logging.error("Outra cópia do MeMi BOT já está rodando; esta foi encerrada.")
+        raise SystemExit("O MeMi BOT já está rodando. Feche a outra cópia antes de abrir esta.")
+    ouvir_pedidos(trava)
+    executar()
+    reabrir_se_pedido(trava)
